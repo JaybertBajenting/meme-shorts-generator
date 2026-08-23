@@ -1,0 +1,30 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <!-- net8.0-windows: LTS, and -windows is required for System.Speech (SAPI) + System.Drawing fallback -->
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>MemeShorts.Api</RootNamespace>
+    <AssemblyName>MemeShorts.Api</AssemblyName>
+    <!-- Read all source as UTF-8 (BOM-less files were being mis-decoded as Windows-1252). -->
+    <CodePage>65001</CodePage>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Python helper scripts must sit next to the app at runtime -->
+    <Content Include="tools\**\*.py" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Microsoft Windows TTS (classic SAPI5 desktop voices) -->
+    <PackageReference Include="Google.Apis.YouTube.v3" Version="1.75.0.4176" />
+    <PackageReference Include="System.Speech" Version="8.0.0" />
+    <!-- Fallback panel renderer when Codex image generation is unavailable -->
+    <PackageReference Include="System.Drawing.Common" Version="8.0.10" />
+    <!-- Durable state (background offset history) -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+  </ItemGroup>
+
+</Project>
+

@@ -1,0 +1,39 @@
+# .NET
+bin/
+obj/
+
+# Node / Remotion
+node_modules/
+
+# Generated per-job output (panels, audio, props, mp4)
+out/
+
+# Render temp (Remotion/Chrome/ffmpeg) redirected here off C:
+render-tmp/
+
+# OAuth client secrets + cached tokens — NEVER commit
+secrets/
+
+# API keys / long-lived access tokens (ElevenLabs, Facebook, Instagram) — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Durable state DB
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Background clips + music (large binaries) — keep the README placeholders
+assets/backgrounds/*.mp4
+assets/backgrounds/*.mkv
+assets/backgrounds/*.mov
+assets/backgrounds/*.webm
+assets/music/*.mp3
+assets/music/*.m4a
+assets/music/*.wav
+
+# OS
+Thumbs.db
+.DS_Store

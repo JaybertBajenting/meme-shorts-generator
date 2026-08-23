@@ -1,0 +1,51 @@
+# ---- credentials: never commit ----
+.env
+*.env
+!.env.example
+**/secrets/
+**/*client_secret*.json
+**/*token*/
+
+# ---- build output ----
+[Bb]in/
+[Oo]bj/
+node_modules/
+dist/
+build/
+
+# ---- generated video work (12.5 GB of rendered jobs) ----
+src/MemeShorts.Api/out/
+src/MemeShorts.Api/render-tmp/
+MemeShortsGenerator/src/MemeShorts.Api/out/
+MemeShortsGenerator/src/MemeShorts.Api/render-tmp/
+render-tmp/
+state.db
+*.db-shm
+*.db-wal
+
+# ---- heavy media the repo does not need (10 GB of gameplay + music) ----
+MemeShortsGenerator/assets/backgrounds/
+MemeShortsGenerator/assets/music/
+assets/backgrounds/
+assets/music/
+
+# ---- reference material downloaded for study ----
+MemeShortsGenerator/analysis/
+analysis/
+pasted-posts/
+_montage/
+_frames/
+
+# ---- logs and scratch ----
+*.log
+app.stdout.log
+app.stderr.log
+
+# ---- rendered videos (these are output, not source) ----
+*.mp4
+*.webm
+*.mov
+*.wav
+*.mp3
+!MemeShortsGenerator/assets/mascots/*
+!MemeShortsGenerator/assets/toon/**

@@ -1,0 +1,83 @@
+@import "tailwindcss";
+
+/* shadcn/ui design tokens (Tailwind v4 CSS-first config). Dark, "studio" theme. */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+}
+
+:root {
+  /* The app is dark-only, but nothing told the BROWSER that — so every native control the OS
+     draws itself (the <select> option popup, scrollbars, file dialogs) rendered light: black
+     text on white, unreadable against everything around it. This is the one property that
+     fixes all of them at once. */
+  color-scheme: dark;
+  --radius: 0.75rem;
+  --background: oklch(0.16 0.01 285);
+  --foreground: oklch(0.98 0 0);
+  --card: oklch(0.21 0.012 285);
+  --card-foreground: oklch(0.98 0 0);
+  --popover: oklch(0.21 0.012 285);
+  --popover-foreground: oklch(0.98 0 0);
+  --primary: oklch(0.72 0.19 305);
+  --primary-foreground: oklch(0.16 0.01 285);
+  --secondary: oklch(0.27 0.015 285);
+  --secondary-foreground: oklch(0.98 0 0);
+  --muted: oklch(0.27 0.015 285);
+  --muted-foreground: oklch(0.7 0.015 285);
+  --accent: oklch(0.3 0.02 300);
+  --accent-foreground: oklch(0.98 0 0);
+  --destructive: oklch(0.62 0.22 25);
+  --destructive-foreground: oklch(0.98 0 0);
+  --success: oklch(0.7 0.16 155);
+  --success-foreground: oklch(0.16 0.01 285);
+  --border: oklch(0.3 0.015 285);
+  --input: oklch(0.3 0.015 285);
+  --ring: oklch(0.72 0.19 305);
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+@keyframes spin-slow {
+  to {
+    transform: rotate(360deg);
+  }
+}
