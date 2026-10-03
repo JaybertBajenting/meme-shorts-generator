@@ -37,3 +37,6 @@ assets/music/*.wav
 # OS
 Thumbs.db
 .DS_Store
+
+# Python bytecode from tools/*.py
+__pycache__/

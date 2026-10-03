@@ -28,6 +28,18 @@ public sealed record PostBlock(int Top, int Bottom, string? Text, bool IsMedia)
     /// <summary>Which column this slice belongs to; Full spans the whole post.</summary>
     public PostSide Side { get; init; } = PostSide.Full;
 
+    /// <summary>
+    /// Which column of the comparison this slice sits in, counted from the left; null spans the
+    /// whole post.
+    ///
+    /// A comparison is not always two columns. "Applying for a job in... 1998 / 2010 / 2026" is
+    /// three, and while Left/Right was the only vocabulary the middle column was swept in with
+    /// the right one - its lines merged into the right column's rows ("Create an account Apply
+    /// online") and 2010 was never revealed or read on its own. <see cref="Side"/> is now only
+    /// the shorthand the renderer speaks; this is the truth.
+    /// </summary>
+    public int? Column { get; init; }
+
     /// <summary>Horizontal crop. Null spans the full width.</summary>
     public int? XLeft { get; init; }
     public int? XRight { get; init; }
@@ -63,6 +75,16 @@ public sealed record PostBands(
     /// </summary>
     public bool IsDiagram { get; init; }
 
+    /// <summary>
+    /// What happened to the column split, in a few words ("2 group(s) kept", "discarded by
+    /// misaligned:1", "no gutter found").
+    ///
+    /// Both columns arriving at once is the single most reported defect in this format, and up
+    /// to now the only record of WHY a split was thrown away was a log line in a detached
+    /// console nobody reads. Carried on the plan so preflight can report it.
+    /// </summary>
+    public string ColumnNote { get; init; } = "";
+
     /// <summary>Text slices below the header — the ones revealed and read aloud.</summary>
     public IEnumerable<PostBlock> CaptionLines =>
         Blocks.Where(b => !b.IsMedia && b.Top >= HeaderBottom);
@@ -91,10 +113,75 @@ public sealed record PostBands(
             int end = i;
             while (end < caps.Count && caps[end].Group == group) end++;
 
-            foreach (var side in new[] { PostSide.Left, PostSide.Right })
-                foreach (var b in caps.GetRange(i, end - i).Where(b => b.Side == side).OrderBy(b => b.Top))
-                    foreach (var s in b.Segments)
-                        yield return (b, s);
+            var inGroup = caps.GetRange(i, end - i);
+
+            // A comparison can also hold FULL-width rows - a line written across both columns,
+            // or one sitting over the picture beneath them. They are read where they are
+            // written: the ones above the columns first, the ones below them last. Leaving them
+            // out of this walk left them unspoken, and an unspoken slice is on screen from the
+            // first frame.
+            var columnTop = inGroup.Where(b => b.Column is not null)
+                                   .Select(b => (int?)b.Top)
+                                   .Min() ?? int.MaxValue;
+
+            foreach (var b in inGroup.Where(b => b.Column is null && b.Top < columnTop)
+                                     .OrderBy(b => b.Top))
+                foreach (var s in b.Segments)
+                    yield return (b, s);
+
+            var columns = inGroup.Where(b => b.Column is not null)
+                                 .Select(b => b.Column!.Value)
+                                 .Distinct()
+                                 .OrderBy(c => c)
+                                 .ToList();
+
+            // A GRID of panels is not a comparison, and is not read like one.
+            //
+            // Reading each column out whole is right for a table - the whole of 1998, then the
+            // whole of 2010. A 2x2 meme is the other shape: four panels, each with its own
+            // caption, written and read ACROSS then down. Reading it column-first said "my
+            // manager asking if we can install the AI directly into the Wi-Fi" at 4.9s while
+            // that caption stayed hidden until 14.0s, because the typed post - and so the
+            // voice - is in panel order.
+            //
+            // The tell is each column's OWN picture sitting BETWEEN two of its captions: that
+            // is a panel boundary. A table's columns are unbroken lists of text, and a photo
+            // above or below a column is not a boundary, so neither is mistaken for a grid.
+            var groupMedia = Blocks.Where(m => m.IsMedia && m.Group == group).ToList();
+            int RowOf(PostBlock b) =>
+                groupMedia.Count(m => m.Column == b.Column && m.Bottom <= b.Top);
+
+            var isPanelStack = columns.Count > 0 && columns.All(c =>
+                groupMedia.Any(m => m.Column == c
+                    && inGroup.Any(b => b.Column == c && b.Bottom <= m.Top)
+                    && inGroup.Any(b => b.Column == c && b.Top >= m.Bottom)));
+
+            if (isPanelStack)
+            {
+                var lastRow = inGroup.Where(b => b.Column is not null)
+                                     .Select(RowOf)
+                                     .DefaultIfEmpty(0)
+                                     .Max();
+                for (int row = 0; row <= lastRow; row++)
+                    foreach (var column in columns)
+                        foreach (var b in inGroup
+                                     .Where(b => b.Column == column && RowOf(b) == row)
+                                     .OrderBy(b => b.Top))
+                            foreach (var s in b.Segments)
+                                yield return (b, s);
+            }
+            else
+            {
+                foreach (var column in columns)
+                    foreach (var b in inGroup.Where(b => b.Column == column).OrderBy(b => b.Top))
+                        foreach (var s in b.Segments)
+                            yield return (b, s);
+            }
+
+            foreach (var b in inGroup.Where(b => b.Column is null && b.Top >= columnTop)
+                                     .OrderBy(b => b.Top))
+                foreach (var s in b.Segments)
+                    yield return (b, s);
 
             i = end;
         }

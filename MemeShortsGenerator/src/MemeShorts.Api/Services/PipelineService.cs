@@ -26,6 +26,9 @@ public sealed class PipelineService
     private readonly PostSliceService _slicer;
     private readonly DiagramSliceService _diagrams;
     private readonly IOcrService _ocr;
+    private readonly ImageCensorService _censor;
+    private readonly CutoutService _cutout;
+    private readonly RenderValidator _renderCheck;
     private readonly IWebHostEnvironment _env;
     private readonly ILogger<PipelineService> _log;
 
@@ -36,13 +39,14 @@ public sealed class PipelineService
         IWhisperCaptionService whisper, BackgroundHistory bgHistory,
         ITitleStyleService titleStyle, IThumbnailService thumbnailer, ChannelRegistry channels,
         PostSliceService slicer, DiagramSliceService diagrams, IOcrService ocr,
+        ImageCensorService censor, CutoutService cutout, RenderValidator renderCheck,
         IOptions<PipelineOptions> pipe, IOptions<CodexOptions> codexOpt,
         IWebHostEnvironment env, ILogger<PipelineService> log)
     {
         _codex = codex; _tts = tts; _localPanels = localPanels; _renderer = renderer;
         _whisper = whisper; _bgHistory = bgHistory;
         _titleStyle = titleStyle; _thumbnailer = thumbnailer; _channels = channels;
-        _slicer = slicer; _diagrams = diagrams; _ocr = ocr;
+        _slicer = slicer; _diagrams = diagrams; _ocr = ocr; _censor = censor; _cutout = cutout; _renderCheck = renderCheck;
         _pipe = pipe.Value; _codexOpt = codexOpt.Value; _env = env; _log = log;
     }
 
@@ -274,6 +278,22 @@ public sealed class PipelineService
         var outMp4 = Path.Combine(jobDir, "short.mp4");
         job.VideoPath = await _renderer.RenderAsync(propsPath, jobDir, outMp4, ct);
 
+        // CHECK THE FINISHED VIDEO. Every format, not just reposts - a list short reaching the
+        // Review tab frozen or cut short is exactly as bad as a repost doing it, and for a long
+        // while nothing looked at one at all.
+        if (OperatingSystem.IsWindows())
+        {
+            Stage(job, "checking the video", 95);
+            var faults = await _renderCheck.ValidateFileAsync(outMp4, totalMs / 1000.0, ct);
+            if (faults.Count > 0)
+            {
+                job.VideoPath = null;
+                throw new InvalidOperationException(
+                    "The finished video did not pass its own check, so it was not published:\n"
+                    + string.Join("\n", faults.Select(f => $"  - {f.Message}")));
+            }
+        }
+
         // 6. Thumbnail
         if (_pipe.GenerateThumbnail && OperatingSystem.IsWindows())
             await TryGenerateThumbnailAsync(job, sb, beats, ch, outMp4, jobDir, ct);
@@ -318,6 +338,10 @@ public sealed class PipelineService
         PostBands? bands = null;
         var bandTexts = new List<string>();
         var imagePath = input.Image is null ? null : Path.Combine(jobDir, input.Image);
+        // What the RENDERER is given. It becomes a censored copy of the pasted picture the
+        // moment a swear word is found in it; the pasted original is left on disk untouched so
+        // the job can be re-voiced or re-diagnosed from what actually arrived.
+        var renderImage = input.Image;
 
         // Typed text WINS. It is the corrected version of what OCR misread, so ignoring it
         // whenever slicing happened to succeed (which is the normal case) made the box a lie.
@@ -331,6 +355,25 @@ public sealed class PipelineService
             // sits, so the slicing and the narration can never disagree about what a line is.
             var ocrLines = await _ocr.ReadLinesAsync(imagePath, ct);
             bands = _slicer.Analyze(imagePath, ocrLines, _diagrams, typedLines);
+
+            // Would this plan leave rows of the picture that nothing draws? Checked BEFORE the
+            // render, because it is free and a render is three minutes. A column split is the
+            // usual culprit, and a plain full-width reveal is always safe - so if the split is
+            // the thing producing blank rows, drop it and re-slice rather than shipping a card
+            // with a hole in it.
+            var gaps = _renderCheck.ValidateBands(bands);
+            if (gaps.Count > 0 && bands.Gutter is not null)
+            {
+                _log.LogWarning("Repost {Id}: the column split would leave blank rows ({Why}). "
+                    + "Re-slicing as one full-width stack.", job.Id,
+                    string.Join("; ", gaps.Select(g => g.Message)));
+                bands = _slicer.Analyze(imagePath, ocrLines, _diagrams, typedLines, allowColumns: false);
+                gaps = _renderCheck.ValidateBands(bands);
+            }
+            if (gaps.Count > 0)
+                _log.LogWarning("Repost {Id}: blank rows remain after falling back ({Why}); the "
+                    + "post-render check will decide.", job.Id,
+                    string.Join("; ", gaps.Select(g => g.Message)));
             // One narration line per SEGMENT, not per block: a comparison meme's band holds two
             // columns, and each needs its own timing so the spotlight can follow the voice.
             // NarrationOrder decides the sequence — one side of a comparison before the other.
@@ -363,14 +406,86 @@ public sealed class PipelineService
                     + string.Join("\n", broken.Select(i => "  - " + i.Message))
                     + "\nTry a tighter crop of just the post, or type the lines in by hand.");
             }
+
+            // Blur any swear words out of the picture. This runs on the SAME OCR pass the
+            // slicing came from, so a hit is covered exactly where that word sits and every
+            // band boundary still lines up - the censored copy is the same size, pixel for
+            // pixel. Only the picture is censored; the voice still reads the post verbatim.
+            renderImage = _censor.Censor(imagePath, ocrLines) ?? input.Image;
         }
 
         var sliced = bands is not null && bandTexts.Count > 0;
-        // In slice mode the narration is one entry per revealed band; typed lines replace the
-        // OCR'd ones positionally, which is what editing a prefilled box naturally produces.
-        var spokenPer = typedLines.Count > 0
-            ? typedLines
-            : sliced ? bandTexts : RepostComposer.Wrap(input.Text ?? "").Select(l => l.Text).ToList();
+
+        // The typed box is the post written CORRECTLY; the slicer holds it cut into the bands
+        // the video reveals. They rarely agree on line count, so the two are matched by content
+        // and each slice speaks the typed spelling of the words it aligns to.
+        //
+        // Both simpler rules have now been shipped and both were wrong. Applying typed lines
+        // POSITIONALLY smeared five stored paragraphs across twelve slices - the huge blank gaps
+        // - and also let a frozen "Ethan" byline be read aloud. Refusing typed text whenever the
+        // counts differed then dropped the narration back to raw OCR, and the voice said
+        // "eleven-m deleting this app and" because OCR reads "I'm" as "11m". Matching keeps the
+        // right words AND one line per slice.
+        var spokenPer = sliced ? bandTexts.ToList() : RepostComposer.Wrap(input.Text ?? "").Select(l => l.Text).ToList();
+
+        // A COMIC is written one panel at a time, and so is the box: its blank-line separated
+        // paragraphs are the panels' captions, in order. Where the counts line up that mapping is
+        // exact, and far better than matching words - most of a comic's lettering is drawn rather
+        // than typed, so panel one of the AI art meme anchored on three words of its own and then
+        // read the whole of panel two's paragraph as well.
+        var paragraphs = (input.Text ?? "")
+            .Replace("\r\n", "\n")
+            .Split(new[] { "\n\n" }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(para => string.Join(" ", para.Split('\n')
+                                                 .Select(x => x.Trim())
+                                                 .Where(x => x.Length > 0)))
+            .Where(para => para.Length > 0)
+            .ToList();
+        var speaking = Enumerable.Range(0, bandTexts.Count)
+                                 .Where(i => bandTexts[i].Trim().Length > 0)
+                                 .ToList();
+
+        if (sliced && (bands?.IsDiagram ?? false) && paragraphs.Count > 0
+            && paragraphs.Count == speaking.Count)
+        {
+            spokenPer = bandTexts.Select(_ => "").ToList();
+            for (int i = 0; i < speaking.Count; i++) spokenPer[speaking[i]] = paragraphs[i];
+            _log.LogInformation("Repost {Id}: {N} panel(s) read from the typed paragraphs.",
+                job.Id, paragraphs.Count);
+        }
+        else if (sliced && typedLines.Count > 0)
+        {
+            spokenPer = RepostComposer.RewordFromTyped(
+                bandTexts, string.Join(" ", typedLines), out var reworded, out var unmatchedSlices);
+
+            // A slice whose words appear NOWHERE in the typed post is something OCR took off the
+            // picture rather than words anyone wrote: "AL" read off the Tarantino meme's "AI" and
+            // spoken "ay-ell", or the Pooh meme's "PAYEDJOIWORICOUT" and "BLUNLOADINCTRUCKS,",
+            // which are its outlined caption read a second time and badly. Those slices keep
+            // their place in the reveal, so the rows still show, and are given nothing to say.
+            //
+            // Only when the typed post really is a transcription of this picture, though - if
+            // barely any slice matched it, the box holds something else (a title, a note) and its
+            // silence would mute the whole video.
+            if (reworded * 2 >= bandTexts.Count)
+            {
+                foreach (var i in unmatchedSlices)
+                {
+                    if (string.IsNullOrWhiteSpace(spokenPer[i])) continue;
+                    _log.LogInformation("Repost {Id}: slice {N} (\"{Text}\") appears nowhere in "
+                        + "the typed post; revealing it without speaking it.",
+                        job.Id, i, spokenPer[i]);
+                    spokenPer[i] = "";
+                }
+            }
+            _log.LogInformation(
+                "Repost {Id}: re-worded {N} of {Total} slice(s) from the typed text; the rest keep "
+                + "their own reading.", job.Id, reworded, bandTexts.Count);
+        }
+        else if (!sliced && typedLines.Count > 0)
+        {
+            spokenPer = typedLines;
+        }
 
         var useTyped = !sliced;
 
@@ -415,7 +530,25 @@ public sealed class PipelineService
 
             if (heard is { Count: > 0 })
             {
-                var unspoken = RepostComposer.Align(lines, heard);
+                var unmatched = RepostComposer.Align(lines, heard);
+
+                // Only lines OUTSIDE the spoken span are dropped. A line the transcript missed
+                // that sits BETWEEN two it did hear was certainly read out - the voice reads the
+                // script top to bottom - and it is usually a coinage the transcript spells its
+                // own way ("Zucken-Musk"). Dropping those threw away real content AND left one
+                // more slice than narration line, so every reveal after it ran ahead of the
+                // voice. Align now interpolates their timing, so they can simply stay.
+                var matchedIdx = Enumerable.Range(0, lines.Count)
+                    .Where(i => !unmatched.Contains(i))
+                    .ToList();
+                var unspoken = matchedIdx.Count == 0
+                    ? unmatched.ToList()
+                    : unmatched.Where(i => i < matchedIdx[0] || i > matchedIdx[^1]).ToList();
+                foreach (var i in unmatched.Where(i => !unspoken.Contains(i)))
+                    _log.LogInformation("Repost {Id}: card line {N} is not in the transcript but "
+                        + "sits inside it, so it was spoken; keeping it: {Text}",
+                        job.Id, i, lines[i].Text);
+
                 if (unspoken.Count > 0)
                 {
                     // A card line nobody reads still takes a reveal slot, so everything after it
@@ -463,7 +596,7 @@ public sealed class PipelineService
             // In slice mode the words live in the OCR'd bands, not in input.Text — which is
             // empty whenever the picture carries its own text (i.e. the normal case). Passing
             // input.Text here made the titler bail instantly and fall back every time.
-            var postWords = useTyped ? input.Text : string.Join("\n", bandTexts);
+            var postWords = useTyped ? input.Text ?? "" : string.Join("\n", bandTexts);
             title = await _codex.GenerateRepostTitleAsync(postWords, styleTitles, ct) ?? "";
             if (title.Length > 0)
                 _log.LogInformation("Repost {Id} titled by Codex: {Title}", job.Id, title);
@@ -502,7 +635,7 @@ public sealed class PipelineService
                 AuthorName = input.AuthorName,
                 Headline = input.Headline,
                 Meta = input.Meta,
-                Image = input.Image,
+                Image = renderImage,
                 Lines = lines,
                 // Slice geometry — present only when a screenshot was sliced, which is what
                 // switches the composition from drawing text to uncovering the picture.
@@ -530,15 +663,44 @@ public sealed class PipelineService
 
         // Thumbnail: a real frame near the end, where the card is fully grown — same idea as the
         // meme path, but there are no beats to pick from so it is just a fixed fraction.
+        //
+        // Taken BEFORE the check so a video that fails it still has a poster in the Failed tab.
         if (_pipe.GenerateThumbnail)
         {
             var thumb = await GrabFrameAsync(outMp4, Path.Combine(jobDir, "thumb.jpg"), totalMs * 0.9 / 1000.0, ct);
             if (thumb is not null) job.ThumbnailPath = thumb;
         }
 
+        // CHECK THE FINISHED VIDEO. Everything else in this pipeline validates the plan, which is
+        // how a card with half of it blank reached the Review tab marked "Info". Matthew asked for
+        // this directly - "i dont wanna see any broken or mistakes" - and chose failing the job
+        // over showing a flagged one, so a video that does not pass never becomes reviewable.
+        //
+        // The file is KEPT and stays watchable. Failing the job used to null VideoPath too, which
+        // left nothing to look at but a one-line message - "what picture was this" - and no way to
+        // judge whether the fault was real. The job is Failed, and Approve refuses anything that
+        // is not Done, so a video that lands here still cannot be published; it can only be
+        // watched in the Failed tab and re-rendered once the cause is fixed.
+        if (OperatingSystem.IsWindows())
+        {
+            Stage(job, "checking the video", 95);
+            var faults = _renderCheck.ValidateProps(props)
+                .Concat(await _renderCheck.ValidateAsync(
+                    outMp4, totalMs / 1000.0, props.Post?.GutterFrac is not null, ct))
+                .ToList();
+            if (faults.Count > 0)
+                throw new InvalidOperationException(
+                    "The finished video did not pass its own check, so it was not published:\n"
+                    + string.Join("\n", faults.Select(f => $"  - {f.Message}")));
+        }
+
         // Keep the source post + image so the job can be re-voiced without re-uploading.
         if (_pipe.CleanupIntermediates)
-            CleanupJobScratch(jobDir, new[] { outMp4, job.ThumbnailPath, inputPath }
+            // props.json is KEPT. It is a few KB and the only record of what the reveal actually
+            // did - which slice appeared when, and in which column. Without it neither the
+            // post-render check nor anyone debugging a bad video can see anything but pixels.
+            CleanupJobScratch(jobDir, new[] { outMp4, job.ThumbnailPath, inputPath,
+                    Path.Combine(jobDir, "props.json") }
                 .Concat(input.Image is null ? Array.Empty<string>() : new[] { Path.Combine(jobDir, input.Image) })
                 .ToArray());
 
@@ -567,6 +729,10 @@ public sealed class PipelineService
         var blocks = new List<PostBlockRender>();
         var spotlights = new List<PostSpotlight>();
 
+        // Where each rendered slice sits in the ORIGINAL post, used to order them at the end.
+        // Kept separately because a slice's own Top is its CROP, which reaches upward.
+        var sourceTop = new Dictionary<PostBlockRender, int>();
+
         // A diagram's slices are already whole panels in arrow order — they keep their own
         // rectangles and simply light up one after another, so none of the stacking, crop
         // chaining or column logic below applies.
@@ -594,37 +760,23 @@ public sealed class PipelineService
 
         // Header first, on screen from frame 0.
         foreach (var b in bands.Blocks.Where(b => !b.IsMedia && b.Top < bands.HeaderBottom))
-            blocks.Add(new PostBlockRender
+        {
+            var header = new PostBlockRender
             {
                 // Header spans down to HeaderBottom, which may include the avatar hanging
                 // below the byline text.
                 Top = b.Top, Bottom = Math.Max(b.Bottom, bands.HeaderBottom),
                 StartMs = 0, Text = b.Text,
-            });
+            };
+            sourceTop[header] = b.Top;
+            blocks.Add(header);
+        }
 
         var captions = bands.CaptionLines.ToList();
 
-        // Where each caption's crop starts. Each COLUMN is chained on its own: a caption takes
-        // the gap above it from the previous slice IN ITS OWN COLUMN, so the original line
-        // spacing survives. Chaining down the document instead meant a tall photo in the left
-        // column pushed the chain past every line on the right, and those lines lost the space
-        // above them and came out crammed together.
-        //
-        // Keyed by the block, not by its top edge: two columns routinely start a slice on the
-        // same row, and keying by row silently merged them.
-        var cropTops = new Dictionary<PostBlock, int>();
-        foreach (var lane in bands.Blocks
-                     .Where(b => b.Top >= bands.HeaderBottom)
-                     .GroupBy(b => (b.Group, b.Side)))
-        {
-            var prevBottom = bands.HeaderBottom;
-            foreach (var b in lane.OrderBy(b => b.Top))
-            {
-                if (!b.IsMedia)
-                    cropTops[b] = Math.Max(Math.Min(prevBottom, b.Top), b.Top - 10);
-                prevBottom = Math.Max(prevBottom, b.Bottom);
-            }
-        }
+        // Where each caption's crop starts - one shared definition, in PostSliceService, so the
+        // reveal, the hole patch and the post-render check can never model different rules.
+        var cropTops = PostSliceService.CropTops(bands.Blocks, bands.Width, bands.HeaderBottom);
 
         // Walk the SPOKEN order, not the top-to-bottom one — on a comparison meme they differ,
         // and the reveal has to follow the voice.
@@ -661,7 +813,7 @@ public sealed class PipelineService
 
         foreach (var caption in captions)
         {
-            blocks.Add(new PostBlockRender
+            var line = new PostBlockRender
             {
                 Top = cropTops.TryGetValue(caption, out var ct) ? ct : caption.Top,
                 Bottom = caption.Bottom,
@@ -670,8 +822,11 @@ public sealed class PipelineService
                 XLeft = caption.XLeft,
                 XRight = caption.XRight,
                 Side = SideName(caption.Side),
+                Column = caption.Column,
                 Group = caption.Group,
-            });
+            };
+            sourceTop[line] = caption.Top;
+            blocks.Add(line);
         }
 
         // Clear the blur for the last beat, so the final frame — and the thumbnail taken from
@@ -688,27 +843,57 @@ public sealed class PipelineService
         // above the text on an image board, below it on Instagram, between on a news article.
         foreach (var m in bands.Media)
         {
-            var at = isSinglePhotoPost
-                ? 0
-                : blocks.FirstOrDefault(b => b.Top >= m.Bottom && b.Text is not null)?.StartMs
-                  ?? blocks.LastOrDefault(b => b.Bottom <= m.Top && b.Text is not null)?.StartMs
-                  ?? 0;
+            // Measured on the captions' OWN edges, never on their chained crops. A slice
+            // reaches up into the picture above it to keep the line spacing, so comparing
+            // against that reached-back edge made a picture wait for the SECOND line it heads
+            // instead of the first: the boycotts meme played its opening line over a blank card
+            // and only then revealed the panel the line was describing.
+            int? SpokenAt(PostBlock c) => firstSpokenAt.TryGetValue(c, out var t) ? t : null;
+            var below = captions.Where(c => c.Text is not null && c.Top >= m.Bottom)
+                                .Select(SpokenAt).Where(t => t is not null).ToList();
+            var above = captions.Where(c => c.Text is not null && c.Bottom <= m.Top)
+                                .Select(SpokenAt).Where(t => t is not null).ToList();
+            var at = isSinglePhotoPost ? 0
+                : below.Count > 0 ? below.Min()!.Value
+                : above.Count > 0 ? above.Max()!.Value
+                : 0;
 
             // A picture inside a comparison is whole and full width, so it belongs to the
             // comparison rather than to one column: it arrives with the FIRST line spoken in
             // the group, and stays for the rest of it.
             if (m.Group is not null)
             {
-                var firstInGroup = captions
-                    .Where(c => c.Group == m.Group)
-                    .OrderBy(c => firstSpokenAt.TryGetValue(c, out var t) ? t : int.MaxValue)
-                    .FirstOrDefault();
-                at = firstInGroup is not null && firstSpokenAt.TryGetValue(firstInGroup, out var ft)
-                    ? ft
-                    : 0;
+                // ...and a picture sitting IN a column belongs to that column, so it waits for
+                // that column's turn. Giving every picture the group's first line put the right
+                // half's artwork on screen while the left column was still being read - which is
+                // the "you have shown left and right at the same time" defect itself, and it is
+                // what the two wolves and AI art memes were doing.
+                // Which line of that column it waits for depends on where the picture SITS.
+                // A picture ABOVE its column's lines arrives with the first of them - that is
+                // the wolves photo, read under a heading. A picture BELOW them is the column's
+                // punchline and has to wait for the lines above it to be read. Handing every
+                // picture the column's FIRST line put "I SEE THAT! HEY COMPANIES!!" on screen
+                // at 0ms, under four captions that had not been read yet - the answer given
+                // away before the question, which is the whole point of the format.
+                var mine = captions
+                    .Where(c => c.Group == m.Group
+                             && (m.Side == PostSide.Full || c.Side == m.Side))
+                    .ToList();
+                int Spoken(PostBlock c) => firstSpokenAt.TryGetValue(c, out var t) ? t : int.MaxValue;
+
+                // The first line BELOW it: the reveal reaches the picture's rows as that line is
+                // read, so nothing appears ahead of the line it follows.
+                var anchor = mine.Where(c => c.Top >= m.Bottom - 4).OrderBy(Spoken).FirstOrDefault()
+                    // Nothing below it - the picture ends the column, so it waits for the LAST
+                    // line above it.
+                    ?? mine.Where(c => c.Bottom <= m.Top + 4)
+                           .OrderByDescending(c => firstSpokenAt.TryGetValue(c, out var t) ? t : int.MinValue)
+                           .FirstOrDefault()
+                    ?? mine.OrderBy(Spoken).FirstOrDefault();
+
+                at = anchor is not null && firstSpokenAt.TryGetValue(anchor, out var ft) ? ft : 0;
             }
 
-            var insertAt = blocks.FindIndex(b => b.Top >= m.Bottom);
             var block = new PostBlockRender
             {
                 Top = m.Top,
@@ -717,10 +902,35 @@ public sealed class PipelineService
                 XLeft = m.XLeft,
                 XRight = m.XRight,
                 Side = SideName(m.Side),
+                Column = m.Column,
                 Group = m.Group,
             };
-            if (insertAt >= 0) blocks.Insert(insertAt, block); else blocks.Add(block);
+            sourceTop[block] = m.Top;
+            blocks.Add(block);
         }
+
+        // THE ORDER OF THIS LIST IS THE LAYOUT: the card stacks what it is given, top to bottom.
+        //
+        // So it has to be the post's own order, measured on the original rows - a slice's Top is
+        // its crop, which reaches upward into whatever is above it, and ordering on that put the
+        // first caption of "two wolves" ABOVE the photo it is written under. Every slice of a
+        // comparison carries the group's first row, which both keeps the columns where they
+        // belong in the post and keeps them in ONE run: split into two runs, the card draws the
+        // group's box twice and the post comes out taller than itself.
+        var groupRow = bands.Blocks
+            .Where(b => b.Group is not null)
+            .GroupBy(b => b.Group!.Value)
+            .ToDictionary(g => g.Key, g => g.Min(b => b.Top));
+
+        int RowOf(PostBlockRender b) =>
+            b.Group is { } g && groupRow.TryGetValue(g, out var top)
+                ? top
+                : sourceTop.TryGetValue(b, out var own) ? own : b.Top;
+
+        blocks = blocks
+            .OrderBy(RowOf)
+            .ThenBy(b => sourceTop.TryGetValue(b, out var own) ? own : b.Top)
+            .ToList();
 
         return (blocks, spotlights);
     }
@@ -732,6 +942,26 @@ public sealed class PipelineService
     /// word timings, background and music staging — because the only thing that differs is
     /// where the pictures come from. Nothing is written or drawn here; both halves are supplied.
     /// </summary>
+    /// <summary>
+    /// A picture's width/height, so the list card can take the media's own shape. Null when it
+    /// cannot be read - the card then falls back to its default.
+    /// </summary>
+    private double? PictureAspect(string path)
+    {
+        if (!OperatingSystem.IsWindows() || !File.Exists(path)) return null;
+        try
+        {
+            using var img = System.Drawing.Image.FromFile(path);
+            if (img.Width <= 0 || img.Height <= 0) return null;
+            return (double)img.Width / img.Height;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Could not read the size of {File}.", Path.GetFileName(path));
+            return null;
+        }
+    }
+
     private async Task RunListAsync(GenerationJob job, EffectiveChannel ch, CancellationToken ct)
     {
         var jobDir = job.OutputDir;
@@ -750,37 +980,169 @@ public sealed class PipelineService
         if (items.Count == 0)
             throw new InvalidOperationException("Nothing to make — every item needs a picture and a line.");
 
-        // 1. One voice clip per line, laid end to end with the usual small gap between beats.
-        Stage(job, "voicing the lines", 25);
-        var beats = new List<RenderBeat>();
-        var wavPaths = new List<string>();
-        var cursor = 0;
-        var gap = _pipe.BeatGapMs;
-
+        // A picture cut out in an EARLIER render sits on disk under its cutout name while
+        // list.json still names the original, so every re-render asked the renderer for a file
+        // that no longer existed and 404'd. That made re-rendering ANY list short impossible -
+        // the format this channel publishes most - and it was invisible until one was tried.
+        var renamed = false;
         for (int i = 0; i < items.Count; i++)
         {
-            var audioName = $"vo_{i}.wav";
-            var wavPath = Path.Combine(jobDir, audioName);
-            var dur = await _tts.SynthesizeAsync(items[i].Text, wavPath, ch.WindowsVoice, null, ct);
-            if (dur <= 0) dur = (int)Math.Round(items[i].Text.Split(' ').Length / 190.0 * 60_000);
+            var name = items[i].Image!;
+            if (File.Exists(Path.Combine(jobDir, name))) continue;
+            var cutoutName = Path.GetFileNameWithoutExtension(name) + ".cutout.png";
+            if (File.Exists(Path.Combine(jobDir, cutoutName)))
+            {
+                _log.LogInformation("List {Id}: {Old} was cut out previously; using {New}.",
+                    job.Id, name, cutoutName);
+                items[i] = new ListItem { Image = cutoutName, Text = items[i].Text };
+                renamed = true;
+            }
+        }
+
+        // 0. Cut the subject out of any picture that was shot on a plain background.
+        //
+        // The last measured difference from the reference channel: his artwork is a cutout
+        // sitting on the card's own white, ours were photo rectangles. Only pictures that can be
+        // cut SAFELY are converted - the rest stay photographs, because a botched cutout on a
+        // white card looks worse than an honest rectangle. See CutoutService.
+        var cut = 0;
+        if (OperatingSystem.IsWindows())
+        {
+            Stage(job, "cutting out pictures", 15);
+            for (int i = 0; i < items.Count; i++)
+            {
+                var path = Path.Combine(jobDir, items[i].Image!);
+                if (!File.Exists(path) || IsVideoMedia(path)) continue;
+                var cutout = _cutout.TryCutout(path);
+                if (cutout is null) continue;
+                items[i] = new ListItem { Image = cutout, Text = items[i].Text };
+                cut++;
+            }
+            _log.LogInformation("List {Id}: cut out {N} of {Total} picture(s).", job.Id, cut, items.Count);
+        }
+
+        // The stored input must name the files that now exist - both the ones just cut out and
+        // the ones a PREVIOUS render cut. Without this the cutout is a one-way door: it replaces
+        // the picture on disk and the job can never be re-rendered again.
+        if (cut > 0 || renamed)
+        {
+            input.Items = items;
+            WriteJsonNoBom(inputPath, input);
+        }
+
+        // 1. ONE voice take for the whole script, not a clip per line.
+        //
+        // The reference cuts to a new picture every ~1.2s (measured across 20 of his Shorts), so
+        // a line is now a few words, and voicing each as its own clip put a gap and a fresh
+        // intonation at every cut. One take reads like one person talking - his median is
+        // 201 wpm with the first word at 0.0s - and the pictures are cut at word timings after.
+        Stage(job, "voicing the script", 25);
+        var lines = items.Select(i => i.Text.Trim()).ToList();
+        const string narrationName = "narration.wav";
+        var narrationPath = Path.Combine(jobDir, narrationName);
+        // Cued per SENTENCE, not per line: a sentence spans several picture lines, and cueing only
+        // the fragment that carries the "!" made the voice perk up for its last two words.
+        var speechMs = await _tts.SynthesizeAsync(
+            AudioTags.Cue(string.Join(" ", lines), SpeakableListLine), narrationPath, ch.WindowsVoice, null, ct, ch.WindowsRate);
+        if (speechMs <= 0)
+            speechMs = (int)Math.Round(lines.Sum(l => l.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length) / 200.0 * 60_000);
+
+        // 2. Word timings for the take, then every written word placed on them.
+        Stage(job, "timing captions", 60);
+        List<WordTiming>? heard = null;
+        if (_whisper.Enabled)
+        {
+            var timings = await _whisper.TranscribeAsync(new[] { narrationPath }, ct);
+            if (timings is not null && timings.TryGetValue(narrationPath, out var w)) heard = w;
+        }
+        if (heard is null)
+            _log.LogWarning("List {Id}: no word timings for the narration; spreading lines by length.", job.Id);
+
+        // PACE. The first one-take render measured 160 wpm with the voice's global rate at 1.05;
+        // his median is 201. Rather than move the global rate (the meme format shares it and was
+        // tuned separately), measure THIS take and time-stretch it to his pace. atempo keeps the
+        // pitch, and the cap keeps a very slow take from turning into chipmunk speech.
+        if (heard is { Count: >= 5 })
+        {
+            var spanMs = Math.Max(1, heard[^1].EndMs - heard[0].StartMs);
+            var wordCount = lines.Sum(l => l.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length);
+            var wpm = wordCount / (spanMs / 60_000.0);
+            var factor = Math.Clamp(ListTargetWpm / wpm, 1.0, 1.35);
+            if (factor > 1.02)
+            {
+                var stretched = Path.Combine(jobDir, "narration_fast.wav");
+                try
+                {
+                    await RunFfmpegAsync(
+                        $"-y -i \"{narrationPath}\" -filter:a \"atempo={factor.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}\" \"{stretched}\"",
+                        ct);
+                    File.Move(stretched, narrationPath, overwrite: true);
+                    heard = heard.Select(w => new WordTiming(w.Text,
+                        (int)Math.Round(w.StartMs / factor), (int)Math.Round(w.EndMs / factor))).ToList();
+                    speechMs = (int)Math.Round(speechMs / factor);
+                    _log.LogInformation("List {Id}: take read at {Wpm:0} wpm; sped up x{Factor:0.00} to ~{Target}.",
+                        job.Id, wpm, factor, ListTargetWpm);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "List {Id}: could not speed the narration up; keeping it as read.", job.Id);
+                }
+            }
+        }
+        var timed = NarrationAligner.Align(lines, heard, speechMs);
+
+        // His picture lands a hair BEFORE the word it shows - 0.1-0.2s ahead on the gelatin
+        // short (jello at 3.25s for "gelatin" at 3.46s). Cutting exactly on the word reads late.
+        const int pictureLeadMs = 120;
+        var minBeatMs = (int)Math.Ceiling(1000.0 / fps) * 3;
+        var beats = new List<RenderBeat>();
+        for (int i = 0; i < items.Count; i++)
+        {
+            var first = timed.FirstOrDefault(t => t.Line == i);
+            var start = i == 0 ? 0 : Math.Max(beats[^1].StartMs + minBeatMs, (first?.StartMs ?? beats[^1].EndMs) - pictureLeadMs);
+            if (beats.Count > 0) beats[^1].EndMs = start;
+
+            var mediaName = items[i].Image!;
+            var mediaPath = Path.Combine(jobDir, mediaName);
+            var isClip = IsVideoMedia(mediaPath);
+            var clipSeconds = isClip ? await ProbeDurationSecondsAsync(mediaPath, ct) : null;
+            var mediaAspect = isClip
+                ? await ProbeVideoAspectAsync(mediaPath, ct)
+                : PictureAspect(mediaPath);
 
             beats.Add(new RenderBeat
             {
                 Index = i,
                 Caption = items[i].Text,
-                Panel = items[i].Image,
-                Audio = audioName,
-                StartMs = cursor,
-                EndMs = cursor + dur,
+                Panel = isClip ? "" : mediaName,
+                Clip = isClip ? mediaName : null,
+                ClipLoopFrames = isClip && clipSeconds is double seconds
+                    ? Math.Max(1, (int)Math.Round(seconds * fps))
+                    : null,
+                IsCutout = !isClip && mediaName.EndsWith(".cutout.png", StringComparison.OrdinalIgnoreCase),
+                Audio = "",
+                StartMs = start,
+                EndMs = Math.Max(start + minBeatMs, speechMs),
+                PanelAspect = mediaAspect,
             });
-            wavPaths.Add(wavPath);
-            cursor += dur + gap;
         }
 
-        // 2. Word timings drive the karaoke captions, exactly as on the meme path.
-        Stage(job, "timing captions", 60);
-        var captions = await BuildCaptionsAsync(beats, wavPaths, ct);
-        var totalMs = beats[^1].EndMs + _pipe.OutroMs;
+        var captions = timed.Select((t, k) => new Caption
+        {
+            // @remotion/captions expects a leading space to join tokens cleanly.
+            Text = (k == 0 ? "" : " ") + t.Text,
+            StartMs = t.StartMs,
+            EndMs = t.EndMs,
+            TimestampMs = t.StartMs + (t.EndMs - t.StartMs) / 2,
+            Confidence = heard is null ? 0.5 : 0.95,
+        }).ToList();
+
+        // His videos stop 0.03-0.4s after the last word (median ~0.15s). The old 700ms tail was
+        // tuned for the meme format's read-aloud comment and is dead air here. 300 still measured
+        // 0.47-0.63s of silence at the end - the voice's own trailing breath comes on top.
+        const int listTailMs = 100;
+        var totalMs = beats[^1].EndMs + listTailMs;
+        beats[^1].EndMs = totalMs;
 
         Stage(job, "staging background", 70);
         var (backgroundName, backgroundLoopFrames) =
@@ -792,7 +1154,12 @@ public sealed class PipelineService
         // Fall back to the channel's own mascot when the job didn't bring one, so every video
         // carries the character without it having to be attached by hand each time.
         var mascotName = input.Mascot;
-        if (string.IsNullOrWhiteSpace(mascotName)) mascotName = TryStageMascot(jobDir, ch.MascotPath);
+        var usesChannelMascot = string.IsNullOrWhiteSpace(mascotName);
+        if (usesChannelMascot) mascotName = TryStageMascot(jobDir, ch.MascotPath);
+        // Poses only exist for the channel's own character; a mascot uploaded with the job is one image.
+        var mascotPoses = usesChannelMascot
+            ? TryStageMascotPoses(jobDir, ch.MascotPath, mascotName)
+            : mascotName is null ? new List<string>() : new List<string> { mascotName };
 
         Stage(job, "titling", 80);
         var title = (input.Title ?? "").Trim();
@@ -803,9 +1170,15 @@ public sealed class PipelineService
                         string.Join(" ", items.Select(i => i.Text)), styleTitles, ct)
                     ?? items[0].Text;
         }
-        job.YouTubeTitle = Truncate(PackageMemeTitle(title) + ch.TitleSuffix, 100);
+        job.YouTubeTitle = Truncate(PackageListTitle(title) + ch.TitleSuffix, 100);
         var desc = ch.DescriptionTemplate.Replace("{title}", title);
         if (!string.IsNullOrWhiteSpace(musicAttribution)) desc += "\n\n" + musicAttribution.Trim();
+        var imageCreditsPath = Path.Combine(jobDir, "image_credits.txt");
+        if (File.Exists(imageCreditsPath))
+        {
+            var imageCredits = (await File.ReadAllTextAsync(imageCreditsPath, ct)).Trim();
+            if (imageCredits.Length > 0) desc += "\n\nImage credits:\n" + imageCredits;
+        }
         job.YouTubeDescription = desc;
         job.YouTubeTags = ch.Tags;
         job.YouTubeCategoryId = ch.CategoryId;
@@ -819,7 +1192,9 @@ public sealed class PipelineService
             Background = backgroundName,
             BackgroundLoopFrames = backgroundLoopFrames,
             // The reference blurs its gameplay hard, so the card is the only thing in focus.
-            BackgroundBlur = 14,
+            // Measured 2026-09-26 as the 10-90% width of edges outside the card: his p25 32-37px
+            // on Minecraft footage, ours 24px at blur 14 - so ~1.45x, i.e. 20.
+            BackgroundBlur = 20,
             Music = musicName,
             MusicVolume = _pipe.MusicVolume,
             MusicLoopFrames = musicLoopFrames,
@@ -827,7 +1202,10 @@ public sealed class PipelineService
             Format = "list",
             ContentType = ch.ContentType,
             Mascot = mascotName,
+            MascotPoses = mascotPoses.Count > 1 ? mascotPoses : null,
+            VisualSeed = StableVisualSeed(job.Id),
             Beats = beats,
+            Narration = narrationName,
             Captions = captions,
         };
 
@@ -836,6 +1214,22 @@ public sealed class PipelineService
         Stage(job, "rendering video", 85);
         var outMp4 = Path.Combine(jobDir, "short.mp4");
         job.VideoPath = await _renderer.RenderAsync(Path.Combine(jobDir, "props.json"), jobDir, outMp4, ct);
+
+        // CHECK THE FINISHED VIDEO. Every format, not just reposts - a list short reaching the
+        // Review tab frozen or cut short is exactly as bad as a repost doing it, and for a long
+        // while nothing looked at one at all.
+        if (OperatingSystem.IsWindows())
+        {
+            Stage(job, "checking the video", 95);
+            var faults = await _renderCheck.ValidateFileAsync(outMp4, totalMs / 1000.0, ct);
+            if (faults.Count > 0)
+            {
+                job.VideoPath = null;
+                throw new InvalidOperationException(
+                    "The finished video did not pass its own check, so it was not published:\n"
+                    + string.Join("\n", faults.Select(f => $"  - {f.Message}")));
+            }
+        }
 
         if (_pipe.GenerateThumbnail)
         {
@@ -859,6 +1253,23 @@ public sealed class PipelineService
         job.State = JobState.Done;
     }
 
+    /// <summary>CobbleCat's narration pace: median 201 wpm across his 20 latest Shorts (p10 191, p90 227).</summary>
+    private const double ListTargetWpm = 200;
+
+    /// <summary>
+    /// A list line as the VOICE should get it. The script shouts a word or two for the caption
+    /// ("is ACTUALLY a WEAPON"), and the voice reads a long all-caps word as an initialism -
+    /// "THE ALGORITHM" came out of a finished video as "The Algoramp". Caps of 4+ letters are
+    /// lowered for the audio only; short ones ("AI", "CEO") stay caps so they are still spelled.
+    /// The captions keep the written casing.
+    /// </summary>
+    private static string SpeakableListLine(string line) =>
+        string.Join(' ', line.Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(w =>
+        {
+            var letters = w.Count(char.IsLetter);
+            return letters >= 4 && w.Where(char.IsLetter).All(char.IsUpper) ? w.ToLowerInvariant() : w;
+        }));
+
     /// <summary>How long the voice waits between a diagram's labels.</summary>
     private const int DiagramGapMs = 1100;
 
@@ -880,7 +1291,15 @@ public sealed class PipelineService
         for (int i = 0; i < spoken.Count; i++)
         {
             var text = RepostComposer.Spoken(spoken[i]);
-            if (text.Length == 0) { if (i < lines.Count) lines[i].StartMs = at; continue; }
+            if (text.Length == 0)
+            {
+                // A panel nobody reads out is still a panel - the AI art comic's punchline has no
+                // words in it at all. Given no time of its own it was revealed after the video had
+                // already ended, so it never appeared. It gets a beat like every other panel.
+                if (i < lines.Count) lines[i].StartMs = at;
+                at += DiagramGapMs * 2;
+                continue;
+            }
 
             var part = Path.Combine(jobDir, $"_vo_{i}.wav");
             var ms = await _tts.SynthesizeAsync(text, part, ch.WindowsVoice, null, ct);
@@ -922,7 +1341,10 @@ public sealed class PipelineService
             try { File.Delete(listFile); } catch { /* scratch */ }
         }
 
+        // Long enough to hold the last panel, which may be a silent one - the audio ends before
+        // the reveal does, and the composition has to outlast the audio for it to be seen.
         var total = Math.Max(at - DiagramGapMs, 1);
+        if (lines.Count > 0) total = Math.Max(total, lines[^1].StartMs + DiagramGapMs * 2);
         _log.LogInformation("Diagram voiceover: {N} label(s), {Gap}ms apart, {Total}ms total.",
             parts.Count, DiagramGapMs, total);
         return total;
@@ -1385,6 +1807,40 @@ public sealed class PipelineService
         return ClicheEscalationTerms.FirstOrDefault(t => text.Contains(t, StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// The list (CobbleCat) channel's emoji, in the proportions of his latest 200 titles: 70% carry
+    /// one, and it is 😭 far more than anything else (109 of them), then 🤣 (34); 😂 is rare and
+    /// 💀 / 🤔 never appear. <see cref="PackageMemeTitle"/> was picking uniformly from a set built
+    /// for the other channel, so most of ours ended 😂, 💀 or 🤔.
+    /// </summary>
+    private static string PackageListTitle(string title)
+    {
+        var clean = title.Trim();
+        while (clean.EndsWith("#Shorts", StringComparison.OrdinalIgnoreCase))
+            clean = clean[..^7].TrimEnd();
+        // Keep an emoji the script already chose.
+        if (clean.Length > 0 && char.IsSurrogate(clean[^1])) return clean;
+
+        uint hash = 2166136261;
+        foreach (char c in clean)
+        {
+            hash ^= char.ToLowerInvariant(c);
+            hash *= 16777619;
+        }
+        var roll = hash % 100;
+        var emoji = roll switch
+        {
+            < 30 => "",
+            < 72 => "😭",
+            < 84 => "🤣",
+            < 90 => "😭😭",
+            < 94 => "🤯",
+            < 97 => "🤣😭",
+            _ => "🥹",
+        };
+        return emoji.Length == 0 ? clean : $"{clean} {emoji}";
+    }
+
     private static string PackageMemeTitle(string title)
     {
         var clean = title.Trim();
@@ -1450,6 +1906,37 @@ public sealed class PipelineService
             _log.LogWarning(ex, "Could not stage the mascot from {Path}.", src);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Extra poses of the channel mascot: any "&lt;mascot name&gt;_*.png" beside the main sprite
+    /// (cobblecat_point.png, cobblecat_shock.png, ...). The reference character switches pose on
+    /// some picture cuts; one static sprite could not. Returns the staged names, main pose first.
+    /// </summary>
+    private List<string> TryStageMascotPoses(string jobDir, string? mascotPath, string? mainName)
+    {
+        var poses = new List<string>();
+        if (mainName is null) return poses;
+        poses.Add(mainName);
+        if (string.IsNullOrWhiteSpace(mascotPath)) return poses;
+        var src = Path.IsPathRooted(mascotPath) ? mascotPath : Path.Combine(_env.ContentRootPath, mascotPath);
+        var dir = Path.GetDirectoryName(src);
+        if (dir is null || !Directory.Exists(dir)) return poses;
+        foreach (var file in Directory.GetFiles(dir, Path.GetFileNameWithoutExtension(src) + "_*.png").OrderBy(f => f))
+        {
+            var suffix = Path.GetFileNameWithoutExtension(file)[(Path.GetFileNameWithoutExtension(src).Length + 1)..];
+            var name = $"mascot_{suffix}.png";
+            try
+            {
+                File.Copy(file, Path.Combine(jobDir, name), overwrite: true);
+                poses.Add(name);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Could not stage mascot pose {Path}.", file);
+            }
+        }
+        return poses;
     }
 
     private async Task<(string? name, int? loopFrames)> TryStageBackgroundAsync(string jobDir, string backgroundDir, int fps, int totalMs, CancellationToken ct)
@@ -1594,6 +2081,29 @@ public sealed class PipelineService
     private static string Truncate(string s, int n) =>
         string.IsNullOrEmpty(s) ? s : (s.Length <= n ? s : s[..n]);
 
+    private static bool IsVideoMedia(string path)
+    {
+        var ext = Path.GetExtension(path);
+        return ext.Equals(".mp4", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".webm", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".mov", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".m4v", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int StableVisualSeed(string value)
+    {
+        unchecked
+        {
+            uint hash = 2166136261;
+            foreach (var ch in value)
+            {
+                hash ^= ch;
+                hash *= 16777619;
+            }
+            return (int)(hash & 0x7fffffff);
+        }
+    }
+
     /// <summary>Parse a clip's duration in seconds from `ffmpeg -i` stderr. Null if unknown.</summary>
     private async Task<double?> ProbeDurationSecondsAsync(string mp4Path, CancellationToken ct)
     {
@@ -1619,6 +2129,35 @@ public sealed class PipelineService
         catch (Exception ex)
         {
             _log.LogWarning(ex, "ffmpeg duration probe failed for {Path}.", mp4Path);
+        }
+        return null;
+    }
+
+    /// <summary>Read the first video stream's display aspect from ffmpeg diagnostics.</summary>
+    private async Task<double?> ProbeVideoAspectAsync(string videoPath, CancellationToken ct)
+    {
+        try
+        {
+            var res = await ProcessRunner.RunAsync(
+                _pipe.FfmpegCommand,
+                new[] { "-hide_banner", "-i", videoPath },
+                workingDir: null, TimeSpan.FromSeconds(30), ct);
+
+            var match = Regex.Match(
+                res.StdErr,
+                @"Video:.*?(?<width>\d{2,5})x(?<height>\d{2,5})",
+                RegexOptions.IgnoreCase | RegexOptions.Singleline);
+            if (match.Success
+                && int.TryParse(match.Groups["width"].Value, out var width)
+                && int.TryParse(match.Groups["height"].Value, out var height)
+                && width > 0 && height > 0)
+            {
+                return (double)width / height;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "ffmpeg aspect probe failed for {Path}.", videoPath);
         }
         return null;
     }

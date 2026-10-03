@@ -47,7 +47,10 @@ public static class PostPlanValidator
         // --- slices in the same lane must not share pixels ---
         // This is the "the lines overlap it" failure: two slices covering the same rows in the
         // same column render on top of each other.
-        foreach (var lane in blocks.GroupBy(b => (b.Group, b.Side)))
+        // Panels side by side are their own lane. A comic grid's two top panels cover exactly
+        // the same rows and are not on top of each other at all - they sit beside one another,
+        // which is what the x bounds say.
+        foreach (var lane in blocks.GroupBy(b => (b.Group, b.Column, b.XLeft, b.XRight)))
         {
             var lanes = lane.OrderBy(b => b.Top).ToList();
             for (int i = 1; i < lanes.Count; i++)
@@ -169,22 +172,22 @@ public static class PostPlanValidator
 
         // A column a few pixels wide is not a column. This is the cause behind the hole above,
         // reported separately so the log says WHY rather than only that a hole exists.
-        foreach (var g in blocks.Where(b => b.Group is not null && !b.IsMedia).GroupBy(b => (b.Group, b.Side)))
+        foreach (var g in blocks.Where(b => b.Group is not null && !b.IsMedia).GroupBy(b => (b.Group, b.Column)))
         {
             var w = g.Max(b => Math.Min(bands.Width, b.XRight ?? bands.Width))
                   - g.Min(b => Math.Max(0, b.XLeft ?? 0));
             if (w < bands.Width * 0.12)
                 Add(PlanSeverity.Broken, "sliver-column",
-                    $"The {g.Key.Side} column is only {w}px wide against a {bands.Width}px post — the column split landed in the wrong place.");
+                    $"Column {(g.Key.Column ?? 0) + 1} is only {w}px wide against a {bands.Width}px post — the column split landed in the wrong place.");
         }
 
         // --- half a comparison is worse than none ---
         foreach (var g in blocks.Where(b => b.Group is not null).GroupBy(b => b.Group))
         {
-            var sides = g.Select(b => b.Side).Distinct().ToList();
-            if (sides.Count == 1)
+            var columns = g.Select(b => b.Column).Distinct().ToList();
+            if (columns.Count == 1)
                 Add(PlanSeverity.Warn, "one-sided-comparison",
-                    $"A side-by-side group only has its {sides[0]} column — the other half is missing.");
+                    $"A side-by-side group only has column {(columns[0] ?? 0) + 1} — the rest is missing.");
         }
 
         // --- the header should be a header, not the post ---

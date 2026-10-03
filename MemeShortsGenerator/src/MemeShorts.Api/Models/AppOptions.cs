@@ -396,3 +396,77 @@ public sealed class RemotionOptions
     /// </summary>
     public int OffthreadVideoCacheMb { get; set; } = 512;
 }
+
+/// <summary>
+/// Blurring swear words out of a pasted post screenshot before it is filmed.
+///
+/// This only touches the PICTURE. The narration still reads the post verbatim, because that is
+/// what the format is; bleeping the audio would be a separate job.
+/// </summary>
+public sealed class ProfanityOptions
+{
+    /// <summary>Blur swear words in pasted screenshots. Off films the picture exactly as pasted.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Also cover the mild end - damn, hell, crap, ass, piss, wtf. On means "any profanity";
+    /// turn it off to blur only the strong words and the slurs.
+    /// </summary>
+    public bool IncludeMild { get; set; } = true;
+
+    /// <summary>
+    /// How hard the blur is. The word is squeezed to (its height / this) rows, capped at 6, and
+    /// stretched back to size, so higher is blurrier. Below about 3 leaves big text readable.
+    /// </summary>
+    public int Strength { get; set; } = 6;
+
+    /// <summary>Extra words to blur on top of the built-in list, matched as whole words.</summary>
+    public string[] Extra { get; set; } = Array.Empty<string>();
+
+    /// <summary>Words to never blur - the escape hatch for a false positive.</summary>
+    public string[] Allow { get; set; } = Array.Empty<string>();
+}
+
+/// <summary>
+/// Moving finished videos to Google Drive to free space here - the same way YtPipeline
+/// (Downloads\Youtube Pipeline Plan) does it, through the same rclone remote.
+/// </summary>
+public sealed class DriveOptions
+{
+    /// <summary>rclone.exe. A bare name is looked up on PATH.</summary>
+    public string RcloneExecutable { get; set; } = "rclone";
+
+    /// <summary>
+    /// rclone's settings file, which holds the Google sign-in. Empty = the signed-in user's
+    /// Roaming\rclone\rclone.conf, found through Windows rather than the APPDATA variable: an API
+    /// started from another tool's shell (2026-09-30, 4:18 AM) could not find it, and every
+    /// automatic move failed with "didn't find section in config file".
+    /// </summary>
+    public string RcloneConfig { get; set; } = "";
+
+    /// <summary>Where videos go: remote:folder. Each lands in &lt;this&gt;/&lt;channel&gt;/&lt;job id&gt;.</summary>
+    public string Remote { get; set; } = "gdrive:MemeShorts";
+
+    /// <summary>Move published and rejected videos automatically. The Settings tab can override it.</summary>
+    public bool AutoMove { get; set; } = true;
+
+    /// <summary>How often the automatic mover looks for videos that are done with.</summary>
+    public int CheckMinutes { get; set; } = 5;
+}
+
+/// <summary>
+/// Where real photos come from before Codex draws one, in order: Wikipedia, Wikimedia Commons,
+/// Pexels, Openverse (see FallbackImageService); scenes try Pexels only. All four are licensed for reuse; Google Images was
+/// ruled out - its API closed to new sign-ups and ends 2027-01-01, and most of its results are
+/// copyrighted.
+/// </summary>
+public sealed class PicturesOptions
+{
+    /// <summary>Openverse: openly licensed photos (Flickr and others), no key needed.</summary>
+    public bool UseOpenverse { get; set; } = true;
+
+    /// <summary>Pexels: free stock photos. Needs PexelsApiKey (PEXELS_API_KEY in .env).</summary>
+    public bool UsePexels { get; set; } = true;
+
+    public string PexelsApiKey { get; set; } = "";
+}

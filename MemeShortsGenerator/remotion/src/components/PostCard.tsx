@@ -36,7 +36,7 @@ const PARAGRAPH_EXTRA = 35;
 
 export const PostCard: React.FC<{ post: RenderPost }> = ({ post }) => {
   const frame = useCurrentFrame();
-  const { fps } = useVideoConfig();
+  const { fps, height: frameH } = useVideoConfig();
   const nowMs = (frame / fps) * 1000;
 
   const topStart = post.topStart ?? POST_CARD.topStart;
@@ -114,14 +114,19 @@ export const PostCard: React.FC<{ post: RenderPost }> = ({ post }) => {
     // of memory mid-render; the panels barely overlap, so covering is both cheaper and simpler.
     if (post.diagram) {
       const hidden = post.blocks.filter((b) => nowMs < b.startMs - 1);
+      // A diagram or a comic keeps its own shape, so it is CENTRED rather than hung from the
+      // post card's drifting top edge. A near-square comic left at that top sat in the upper
+      // half of the frame with a third of the screen empty below it.
+      const panelH = post.imageHeight! * scale;
+      const panelTop = Math.max(40, Math.round((frameH - panelH) / 2));
       return (
         <div
           style={{
             position: "absolute",
             left: post.left ?? POST_CARD.left,
             width: cardW,
-            height: post.imageHeight! * scale,
-            top,
+            height: panelH,
+            top: panelTop,
             borderRadius: 4,
             boxShadow: "0 10px 34px rgba(0,0,0,0.34)",
             overflow: "hidden",

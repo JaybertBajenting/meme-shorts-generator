@@ -14,6 +14,12 @@ public sealed class RenderProps
 
     [JsonPropertyName("durationInFrames")] public int DurationInFrames { get; set; }
 
+    /// <summary>
+    /// Stable per-job seed for list-card framing and mascot timing. Without this, every video
+    /// with the same number of beats repeats the exact same edit pattern.
+    /// </summary>
+    [JsonPropertyName("visualSeed")] public int VisualSeed { get; set; }
+
     /// <summary>Background clip filename (e.g. "bg.mp4"), or null to use the animated fallback.</summary>
     [JsonPropertyName("background")] public string? Background { get; set; }
 
@@ -34,10 +40,21 @@ public sealed class RenderProps
     /// <summary>List shorts: sticker that perches on the card. Null = none.</summary>
     [JsonPropertyName("mascot")] public string? Mascot { get; set; }
 
+    /// <summary>List shorts: every pose of the mascot, main pose first. Null = just <see cref="Mascot"/>.</summary>
+    [JsonPropertyName("mascotPoses")] public List<string>? MascotPoses { get; set; }
+
     /// <summary>Blur applied to the gameplay behind the card, in px. Null = sharp.</summary>
     [JsonPropertyName("backgroundBlur")] public double? BackgroundBlur { get; set; }
 
     [JsonPropertyName("beats")] public List<RenderBeat> Beats { get; set; } = new();
+
+    /// <summary>
+    /// List shorts: ONE voice take for the whole script, played from frame 0. When set, the
+    /// beats carry no audio of their own. Voicing each line as its own clip left a gap and a
+    /// fresh intonation at every picture change - with a picture every ~1.2s that dragged the
+    /// delivery to ~150 wpm against the reference's 201.
+    /// </summary>
+    [JsonPropertyName("narration")] public string? Narration { get; set; }
 
     /// <summary>Word-level captions in @remotion/captions shape.</summary>
     [JsonPropertyName("captions")] public List<Caption> Captions { get; set; } = new();
@@ -132,8 +149,14 @@ public sealed class PostBlockRender
     [JsonPropertyName("xLeft")] public int? XLeft { get; set; }
     [JsonPropertyName("xRight")] public int? XRight { get; set; }
 
-    /// <summary>"left" / "right" on a comparison, otherwise null.</summary>
+    /// <summary>"left" / "right" on a comparison, otherwise null. Shorthand for <see cref="Column"/>.</summary>
     [JsonPropertyName("side")] public string? Side { get; set; }
+
+    /// <summary>
+    /// Which column of a comparison this slice sits in, from the left; null spans the post.
+    /// A comparison can have three ("1998 / 2010 / 2026"), which "left"/"right" cannot say.
+    /// </summary>
+    [JsonPropertyName("column")] public int? Column { get; set; }
 
     /// <summary>
     /// Comparison id. Slices sharing one are laid out SIDE BY SIDE instead of stacked, so the
@@ -161,6 +184,19 @@ public sealed class RenderBeat
     [JsonPropertyName("options")] public List<string>? Options { get; set; }
     /// <summary>Finance: the data-driven visual to render in the card (null for meme beats).</summary>
     [JsonPropertyName("visual")] public BeatVisual? Visual { get; set; }
+    /// <summary>
+    /// List: the picture's own width/height ratio, so the card can take the MEDIA's shape the way
+    /// the reference channel's does. His cards run 0.64-0.99 (portrait to square) because his
+    /// source material is vertical - phone video and screenshots; ours come out landscape because
+    /// Commons photographs are. Imposing a fixed aspect instead just crops the picture.
+    /// </summary>
+    [JsonPropertyName("panelAspect")] public double? PanelAspect { get; set; }
+    /// <summary>List: foreground video filename. Null means render <see cref="Panel"/>.</summary>
+    [JsonPropertyName("clip")] public string? Clip { get; set; }
+    /// <summary>List: source clip length at the composition frame rate, used for looping.</summary>
+    [JsonPropertyName("clipLoopFrames")] public int? ClipLoopFrames { get; set; }
+    /// <summary>List: transparent subject cutout; render contained on white instead of photo-cover.</summary>
+    [JsonPropertyName("isCutout")] public bool IsCutout { get; set; }
 }
 
 /// <summary>Matches the @remotion/captions Caption type exactly.</summary>

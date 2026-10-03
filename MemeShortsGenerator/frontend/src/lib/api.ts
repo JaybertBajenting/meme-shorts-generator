@@ -27,6 +27,8 @@ export interface Job {
   stage: string;
   percent: number;
   error?: string | null;
+  /** What the finished-video check objected to, on a video sent to review anyway. */
+  checkOverride?: string | null;
   title?: string | null;
   youTubeTitle?: string | null;
   youTubeDescription?: string | null;
@@ -40,6 +42,24 @@ export interface Job {
   uploadError?: string | null;
   facebook: PlatformStatus;
   instagram: PlatformStatus;
+  /** rclone path of the files when they are in Google Drive, else null. */
+  driveRemote?: string | null;
+  driveBytes: number;
+  driveMovedAt?: string | null;
+  /** "moving" | "bringing back" while a transfer runs. */
+  driveTransfer?: string | null;
+  driveError?: string | null;
+}
+
+/** Google Drive status for the Settings tab (see DriveArchiver on the API). */
+export interface DriveStatus {
+  remote: string;
+  autoMove: boolean;
+  inDrive: number;
+  freedBytes: number;
+  waiting: number;
+  moving: { id: string; what: string } | null;
+  failed: { id: string; error: string }[];
 }
 
 export interface Health {
@@ -83,6 +103,20 @@ export interface Channel {
   id: string;
   name: string;
   contentType: string;
+}
+
+/** A background batch of hands-off list videos (see ListBatchRunner on the API). */
+export interface ListBatch {
+  state: "idle" | "running" | "stopping" | "finished" | "stopped" | "quota";
+  channel: string | null;
+  requested: number;
+  attempted: number;
+  step: string | null;
+  message: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  videos: { jobId: string; title: string; droppedLines: number; source: string | null }[];
+  errors: string[];
 }
 
 export const api = {
@@ -172,6 +206,8 @@ export const api = {
         items: {
           text: string;
           term: string;
+          /** "object" / "scene" are drawn by Codex; "real" is a real photo first. */
+          kind?: string | null;
           file: string | null;
           credit: string | null;
           /** Commons page title — identifies the picture, so repeats can be avoided. */
@@ -186,7 +222,11 @@ export const api = {
    * Commons titles the other lines are using, so a swap cannot land on a picture already on
    * screen elsewhere in the same video.
    */
-  listDraftImage: (id: string, body: { index: number; term: string; exclude?: string[] }) =>
+  listDraftImage: (
+    id: string,
+    body: { index: number; term: string; exclude?: string[]; kind?: string | null },
+    signal?: AbortSignal,
+  ) =>
     http
       .post<{
         file: string | null;
@@ -194,7 +234,7 @@ export const api = {
         source?: string | null;
         url?: string | null;
         message?: string;
-      }>(`/api/list/draft/${id}/image`, body)
+      }>(`/api/list/draft/${id}/image`, body, { signal })
       .then((r) => r.data),
 
   listDraftConfirm: (
@@ -213,6 +253,18 @@ export const api = {
         body,
       )
       .then((r) => r.data),
+
+  moveToDrive: (id: string) => http.post(`/api/jobs/${id}/drive/move`).then((r) => r.data),
+  bringBackFromDrive: (id: string) => http.post(`/api/jobs/${id}/drive/restore`).then((r) => r.data),
+  drive: () => http.get<DriveStatus>("/api/drive").then((r) => r.data),
+  setDriveAuto: (enabled: boolean) =>
+    http.post<{ autoMove: boolean }>("/api/drive/auto", { enabled }).then((r) => r.data),
+  moveAllToDrive: () => http.post<{ queued: number }>("/api/drive/move-all").then((r) => r.data),
+
+  listBatch: () => http.get<ListBatch>("/api/generate/list/batch").then((r) => r.data),
+  startListBatch: (body: { count: number; channel?: string | null }) =>
+    http.post<ListBatch>("/api/generate/list/batch", body).then((r) => r.data),
+  stopListBatch: () => http.post<ListBatch>("/api/generate/list/batch/stop").then((r) => r.data),
 
   approve: (id: string) => http.post<Job>(`/api/jobs/${id}/approve`).then((r) => r.data),
   reject: (id: string) => http.post<Job>(`/api/jobs/${id}/reject`).then((r) => r.data),
@@ -246,6 +298,9 @@ export const api = {
 
   /** Re-render a job with the current voice, reusing its script and artwork. */
   revoice: (id: string) => http.post<Job>(`/api/jobs/${id}/revoice`).then((r) => r.data),
+
+  /** Overrule the finished-video check on a failed job and send it to the review queue. */
+  acceptCheck: (id: string) => http.post<Job>(`/api/jobs/${id}/accept-check`).then((r) => r.data),
 
   metaSettings: () => http.get<MetaSettings>("/api/settings/meta").then((r) => r.data),
 

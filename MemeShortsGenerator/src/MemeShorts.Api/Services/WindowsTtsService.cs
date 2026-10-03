@@ -23,9 +23,11 @@ public sealed class WindowsTtsService : ITtsService
     }
 
     public Task<int> SynthesizeAsync(string text, string outputWavPath, string? voiceOverride = null,
-        string? emotion = null, CancellationToken ct = default)
+        string? emotion = null, CancellationToken ct = default, int? windowsRateOverride = null)
     {
-        // SAPI has no emotion control; `emotion` is ignored here (used by ElevenLabs v3).
+        // SAPI has no emotion control; `emotion` is ignored here (used by ElevenLabs v3), and the
+        // list path's inline cues would be read out loud, so they go.
+        text = AudioTags.Strip(text);
         var voice = string.IsNullOrWhiteSpace(voiceOverride) ? _opt.WindowsVoice : voiceOverride;
         // System.Speech is synchronous; run it off the request thread.
         return Task.Run(() =>
@@ -43,7 +45,7 @@ public sealed class WindowsTtsService : ITtsService
                 else _log.LogWarning("SAPI voice matching '{Voice}' not found; using default.", voice);
             }
 
-            synth.Rate = Math.Clamp(_opt.WindowsRate, -10, 10);
+            synth.Rate = Math.Clamp(windowsRateOverride ?? _opt.WindowsRate, -10, 10);
 
             // Fixed PCM format so WavUtils duration math is exact.
             var fmt = new SpeechAudioFormatInfo(44100, AudioBitsPerSample.Sixteen, AudioChannel.Mono);

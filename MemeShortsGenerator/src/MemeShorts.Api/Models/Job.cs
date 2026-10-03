@@ -27,6 +27,17 @@ public sealed class PlatformPublish
 /// <summary>Human approval gate between a finished render and the YouTube upload.</summary>
 public enum ReviewState { None, Pending, Approved, Rejected }
 
+/// <summary>Where a job's files went when they were moved off this PC (see DriveArchiver).</summary>
+public sealed class DriveCopy
+{
+    /// <summary>The rclone path, e.g. gdrive:MemeShorts/cobblecat/f3938c7a.</summary>
+    public string Remote { get; set; } = "";
+    public DateTimeOffset MovedUtc { get; set; }
+    public int Files { get; set; }
+    /// <summary>What the move freed on this PC.</summary>
+    public long Bytes { get; set; }
+}
+
 /// <summary>Tracks one end-to-end generation request. Stored in-memory by JobManager.</summary>
 public sealed class GenerationJob
 {
@@ -48,6 +59,16 @@ public sealed class GenerationJob
     // --- Human review gate (approve -> upload, reject -> discard) ---
     public ReviewState Review { get; set; } = ReviewState.None;
     public DateTimeOffset? ReviewedAt { get; set; }
+
+    /// <summary>
+    /// What the finished-video check objected to, on a video sent to review anyway.
+    ///
+    /// The check is not always right - it measures the plan against the pixels and calls a
+    /// stretch of unsliced picture a fault even where the video reads perfectly. When Matthew
+    /// watches one and decides it passes, the objection is KEPT rather than cleared, so the
+    /// review card still says what was overruled and nothing silently forgets it.
+    /// </summary>
+    public string? CheckOverride { get; set; }
 
     /// <summary>
     /// Re-run this job reusing its existing storyboard and panel art, regenerating only the
@@ -86,6 +107,13 @@ public sealed class GenerationJob
     public PlatformPublish Facebook { get; set; } = new();
     public PlatformPublish Instagram { get; set; } = new();
 
+    // --- Google Drive. Null while the files are on this PC. ---
+    public DriveCopy? Drive { get; set; }
+    /// <summary>Why the last move or bring-back failed; nothing on this PC is deleted when it does.</summary>
+    public string? DriveError { get; set; }
+    /// <summary>"moving" or "bringing back" while a transfer runs. Transient.</summary>
+    [JsonIgnore] public string? DriveTransfer { get; set; }
+
     /// <summary>Per-destination state by platform id ("facebook" / "instagram").</summary>
     public PlatformPublish PlatformState(string platform) => platform switch
     {
@@ -107,6 +135,7 @@ public sealed class JobStatusDto
     public string Stage { get; set; } = "";
     public int Percent { get; set; }
     public string? Error { get; set; }
+    public string? CheckOverride { get; set; }
     public string? Title { get; set; }
     public string? YouTubeTitle { get; set; }
     public string? YouTubeDescription { get; set; }
@@ -125,6 +154,14 @@ public sealed class JobStatusDto
     public PlatformStatusDto Facebook { get; set; } = new();
     public PlatformStatusDto Instagram { get; set; } = new();
 
+    /// <summary>The rclone path of the files when they are in Google Drive, else null.</summary>
+    public string? DriveRemote { get; set; }
+    public long DriveBytes { get; set; }
+    public string? DriveMovedAt { get; set; }
+    /// <summary>"moving" / "bringing back" while a transfer runs.</summary>
+    public string? DriveTransfer { get; set; }
+    public string? DriveError { get; set; }
+
     public static JobStatusDto From(GenerationJob j) => new()
     {
         Id = j.Id,
@@ -140,7 +177,12 @@ public sealed class JobStatusDto
         YouTubeTitle = j.YouTubeTitle ?? j.Storyboard?.YouTubeTitle,
         YouTubeDescription = j.YouTubeDescription,
         YouTubeTags = j.YouTubeTags,
-        HasVideo = j.State == JobState.Done && j.VideoPath is not null,
+        // A FAILED job keeps its file so the Failed tab can play it: the reason a check gave is
+        // rarely enough on its own to tell whether the fault is real. Approving still demands
+        // Done, so this cannot make a rejected video publishable.
+        HasVideo = j.VideoPath is not null && (j.State == JobState.Done || j.State == JobState.Failed)
+                   && j.Drive is null,
+        CheckOverride = j.CheckOverride,
         HasThumbnail = j.ThumbnailPath is not null && File.Exists(j.ThumbnailPath),
         Review = j.Review.ToString().ToLowerInvariant(),
         Upload = j.Upload.ToString().ToLowerInvariant(),
@@ -149,6 +191,11 @@ public sealed class JobStatusDto
         UploadError = j.UploadError,
         Facebook = PlatformStatusDto.From(j.Facebook),
         Instagram = PlatformStatusDto.From(j.Instagram),
+        DriveRemote = j.Drive?.Remote,
+        DriveBytes = j.Drive?.Bytes ?? 0,
+        DriveMovedAt = j.Drive?.MovedUtc.ToString("o"),
+        DriveTransfer = j.DriveTransfer,
+        DriveError = j.DriveError,
     };
 }
 

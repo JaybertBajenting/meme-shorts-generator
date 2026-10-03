@@ -17,7 +17,8 @@ public static class ProcessRunner
         string? workingDir,
         TimeSpan timeout,
         CancellationToken ct = default,
-        IReadOnlyDictionary<string, string>? env = null)
+        IReadOnlyDictionary<string, string>? env = null,
+        string? stdinText = null)
     {
         var argList = args.ToList();
 
@@ -38,6 +39,7 @@ public static class ProcessRunner
             UseShellExecute = false,
             CreateNoWindow = true,
             WorkingDirectory = workingDir ?? Directory.GetCurrentDirectory(),
+            StandardInputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
         };
         foreach (var a in argList) psi.ArgumentList.Add(a);
         if (env is not null)
@@ -54,7 +56,13 @@ public static class ProcessRunner
 
         proc.BeginOutputReadLine();
         proc.BeginErrorReadLine();
-        try { proc.StandardInput.Close(); } catch { /* EOF to child's stdin */ }
+        // Write any input, then close: EOF is what stops tools that read stdin (codex exec) waiting.
+        try
+        {
+            if (stdinText is not null) await proc.StandardInput.WriteAsync(stdinText);
+            proc.StandardInput.Close();
+        }
+        catch { /* the child may not read stdin at all */ }
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(timeout);

@@ -121,6 +121,63 @@ public sealed class JobManager
     /// <summary>Has a short with this topic already been generated? (durable, survives restarts)</summary>
     public bool TopicExists(string topic) => _topics.Exists(topic);
 
+    /// <summary>
+    /// What a new list script must not repeat: the latest scripts and titles, and every subject the
+    /// channel has covered. The scripts are there because the writer once saw only SUBJECTS, so each
+    /// video was fine alone but a batch repeated itself (2 of 7 ended "NO THANK YOU!"). Rejected
+    /// videos count - on 2026-09-29 rejected subjects came straight back (glue pizza a third time,
+    /// hostile benches a second time), because the writer saw only the 30 newest titles.
+    /// </summary>
+    public ListHistory ListHistory(string channelId)
+    {
+        var jobs = _jobs.Values.Where(j => j.ChannelId == channelId && j.Format == "list")
+            .OrderByDescending(j => j.CreatedAt).ToList();
+        var scripts = jobs.Select(j => ReadListScript(Path.Combine(j.OutputDir, "list.json")))
+            .Where(s => s.Length > 0).Take(10).ToList();
+        var titles = jobs.Select(j => j.YouTubeTitle ?? j.Topic).Where(t => !string.IsNullOrWhiteSpace(t))
+            .Take(12).ToList();
+        var subjects = jobs.Select(j => ListSubject(j)).Where(s => s.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase).Take(120).ToList();
+        return new ListHistory(scripts, titles, subjects);
+    }
+
+    /// <summary>The subject a list job was about: its recorded subject, else its script's first sentence, else its title.</summary>
+    private static string ListSubject(GenerationJob job)
+    {
+        var path = Path.Combine(job.OutputDir, "list.json");
+        try
+        {
+            if (File.Exists(path))
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
+                if (doc.RootElement.TryGetProperty("subject", out var s) && s.GetString() is { Length: > 0 } subject)
+                    return subject;
+            }
+        }
+        catch { /* fall through */ }
+        var first = System.Text.RegularExpressions.Regex.Split(ReadListScript(path), @"(?<=[.!?])\s+")
+            .FirstOrDefault(s => s.Trim().Length > 0) ?? "";
+        if (first.Length > 90) first = first[..90];
+        return first.Length > 0 ? first : job.Topic;
+    }
+
+    private static string ReadListScript(string path)
+    {
+        try
+        {
+            if (!File.Exists(path)) return "";
+            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
+            if (!doc.RootElement.TryGetProperty("items", out var items)) return "";
+            return string.Join(" ", items.EnumerateArray()
+                .Select(i => i.TryGetProperty("text", out var t) ? t.GetString() ?? "" : "")
+                .Where(t => t.Length > 0));
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
     /// <summary>Recent topics already made — to steer auto-generation away from repeats.</summary>
     public IReadOnlyList<string> RecentTopics(int take = 40) => _topics.Recent(take);
 
@@ -169,6 +226,27 @@ public sealed class JobManager
 
     public IEnumerable<GenerationJob> Recent(int take = 50) =>
         _jobs.Values.OrderByDescending(j => j.CreatedAt).Take(take);
+
+    /// <summary>Every job, in no particular order.</summary>
+    public IEnumerable<GenerationJob> All() => _jobs.Values;
+
+    /// <summary>Persist a job another service changed (the Drive mover records moves this way).</summary>
+    public void Save(GenerationJob job) => Persist(job);
+
+    /// <summary>
+    /// Has an approved video gone out to EVERY configured destination? Only then is its file no
+    /// longer needed here. Instagram holds the file until its slot (it sits in Scheduled), and a
+    /// failed destination may be retried from the Review tab, so both count as not done.
+    /// </summary>
+    public bool IsPublishedEverywhere(GenerationJob job)
+    {
+        if (job.Review != ReviewState.Approved || !AnyDestinationConfigured) return false;
+        if (_uploader.Configured && job.Upload != UploadState.Uploaded) return false;
+        return _social.Where(s => s.Configured)
+            .All(s => job.PlatformState(s.Platform).State == UploadState.Uploaded);
+    }
+
+    private const string InDriveMessage = "This video's files are in Google Drive. Bring it back first.";
 
     /// <summary>Jobs that have a reserved/known publish time — for the upload calendar.</summary>
     public IEnumerable<GenerationJob> Scheduled() =>
@@ -349,6 +427,37 @@ public sealed class JobManager
     }
 
     /// <summary>Approve a finished job for upload. Returns the job, or null if not found.</summary>
+    /// <summary>
+    /// Send a video that failed its own check to review anyway.
+    ///
+    /// The check errs on the side of failing: it calls a stretch of picture that no slice draws a
+    /// fault, which it usually is, but not always - Matthew watched one whose 78px "blank stretch"
+    /// read perfectly and said "this pass for me, put it on review". This is the manual override
+    /// for exactly that, and it goes no further than the review queue: the video still has to be
+    /// approved by hand before it can upload, and what the check objected to is kept on the job so
+    /// the review card can say what was overruled.
+    /// </summary>
+    public GenerationJob? AcceptFailedCheck(string id)
+    {
+        var job = Get(id);
+        if (job is null) return null;
+        if (job.State != JobState.Failed || job.VideoPath is null || !File.Exists(job.VideoPath))
+        {
+            job.Error = "Only a failed job that still has its video can be sent to review.";
+            return job;
+        }
+
+        _log.LogInformation("Job {Id} sent to review despite its check: {Fault}", job.Id, job.Error);
+        job.CheckOverride = job.Error;
+        job.Error = null;
+        job.State = JobState.Done;
+        job.Percent = 100;
+        job.Stage = "sent to review despite the check";
+        job.Review = ReviewState.Pending;
+        Persist(job);
+        return job;
+    }
+
     public GenerationJob? Approve(string id)
     {
         var job = Get(id);
@@ -356,6 +465,11 @@ public sealed class JobManager
         if (job.State != JobState.Done || job.VideoPath is null)
         {
             job.UploadError = "Job has no finished video to approve.";
+            return job;
+        }
+        if (job.Drive is not null || job.DriveTransfer is not null)
+        {
+            job.UploadError = InDriveMessage;
             return job;
         }
         if (job.Upload is UploadState.Uploading or UploadState.Uploaded) return job;
@@ -409,6 +523,11 @@ public sealed class JobManager
         // pictures + list.json), so it can be remade just as well. Requiring a storyboard meant
         // there was no way to redo a repost at all — and re-queuing it as a new job is refused
         // by the duplicate-topic guard, so those videos were simply stuck as they were.
+        if (job.Drive is not null || job.DriveTransfer is not null)
+        {
+            job.Error = InDriveMessage;
+            return job;
+        }
         var hasStoredInput = File.Exists(Path.Combine(job.OutputDir, "repost.json"))
                           || File.Exists(Path.Combine(job.OutputDir, "list.json"));
         if (job.Storyboard is null && !hasStoredInput)
@@ -445,6 +564,11 @@ public sealed class JobManager
         if (job.State != JobState.Done || job.VideoPath is null)
         {
             job.UploadError = "Job has no finished video to upload.";
+            return job;
+        }
+        if (job.Drive is not null || job.DriveTransfer is not null)
+        {
+            job.UploadError = InDriveMessage;
             return job;
         }
         if (job.Upload == UploadState.Uploading) return job;

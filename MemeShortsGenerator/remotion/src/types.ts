@@ -18,6 +18,18 @@ export type RenderBeat = {
   endMs: number;
   options?: string[] | null;
   visual?: BeatVisual | null; // finance only
+  /**
+   * A short video clip to show in the card instead of the still (list only). His cards are
+   * moving footage 96% of the time. Remotion has no loop prop in this version, so the clip is
+   * wrapped in <Loop> using a frame count measured by the pipeline - the same pattern the
+   * gameplay background already uses.
+   */
+  clip?: string | null;
+  clipLoopFrames?: number | null;
+  /** Transparent subject cutout: contain it on a white sticker instead of cropping like a photo. */
+  isCutout?: boolean;
+  /** The picture's own width/height, so the card can take the media's shape (list only). */
+  panelAspect?: number | null;
 };
 
 export type RenderFakeComment = {
@@ -94,11 +106,15 @@ export type RenderProps = {
   height: number;
   fps: number;
   durationInFrames: number;
+  /** Stable per-render seed so list edits do not repeat the same random sequence every video. */
+  visualSeed?: number;
   background?: string | null;
   backgroundLoopFrames?: number | null;
   contentType?: "meme" | "finance" | "repost" | "list";
   /** List shorts: sticker that perches on the card. Absent = no sticker. */
   mascot?: string | null;
+  /** List shorts: every pose of the mascot, main pose first. Absent = just `mascot`. */
+  mascotPoses?: string[] | null;
   /** List shorts blur the gameplay behind the card so the card carries the eye. */
   backgroundBlur?: number | null;
   /** Set on repost videos; the post card replaces the panel entirely. */
@@ -109,6 +125,8 @@ export type RenderProps = {
   title: string;
   format: string;
   beats: RenderBeat[];
+  /** List shorts: one voice take for the whole script, played from frame 0 (beats carry no audio). */
+  narration?: string | null;
   captions: Caption[];
   fakeComment?: RenderFakeComment | null;
 };

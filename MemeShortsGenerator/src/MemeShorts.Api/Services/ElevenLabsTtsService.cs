@@ -42,7 +42,7 @@ public sealed class ElevenLabsTtsService : ITtsService
     }
 
     public async Task<int> SynthesizeAsync(string text, string outputWavPath, string? voiceOverride = null,
-        string? emotion = null, CancellationToken ct = default)
+        string? emotion = null, CancellationToken ct = default, int? windowsRateOverride = null)
     {
         if (string.IsNullOrWhiteSpace(_opt.ElevenLabsApiKey) || string.IsNullOrWhiteSpace(_voice.VoiceId))
             throw new InvalidOperationException("ElevenLabs requires Tts:ElevenLabsApiKey and Tts:ElevenLabsVoiceId.");
@@ -55,11 +55,13 @@ public sealed class ElevenLabsTtsService : ITtsService
         // ForceEmotion (when set) overrides the per-beat emotion so every line has the same
         // constant high-energy delivery (e.g. always "shouting").
         var effectiveEmotion = string.IsNullOrWhiteSpace(_opt.ForceEmotion) ? emotion : _opt.ForceEmotion;
-        var spoken = text;
+        // The list path cues sentences inline (AudioTags). Only v3 performs them; any other model
+        // would say "excited" out loud.
+        var spoken = IsV3Model(_opt.ElevenLabsModelId) ? text : AudioTags.Strip(text);
         if (!string.IsNullOrWhiteSpace(effectiveEmotion) && IsV3Model(_opt.ElevenLabsModelId))
         {
             var tag = effectiveEmotion.Trim().Trim('[', ']');
-            spoken = $"[{tag}] {text}";
+            spoken = $"[{tag}] {spoken}";
         }
 
         string? bestTmp = null;
