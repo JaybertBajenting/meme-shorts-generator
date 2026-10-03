@@ -2,7 +2,7 @@ import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Check, X, Youtube, RefreshCw, Inbox, Zap, Trash2, Pause, Play, Facebook, Instagram, Mic,
-  Maximize2,
+  Maximize2, AlertTriangle, CloudUpload, CloudDownload, Cloud,
 } from "lucide-react";
 import { api, type Job, type PlatformStatus, videoUrl, thumbnailUrl, type Health } from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
@@ -59,6 +59,7 @@ export function ReviewView({ health }: { health?: Health }) {
       refresh();
     },
   });
+  const acceptCheck = useMutation({ mutationFn: api.acceptCheck, onSuccess: refresh });
   const cancelUnfinished = useMutation({ mutationFn: api.cancelUnfinished, onSuccess: refresh });
   const pauseGeneration = useMutation({ mutationFn: api.pauseGeneration, onSuccess: refresh });
   const resumeGeneration = useMutation({ mutationFn: api.resumeGeneration, onSuccess: refresh });
@@ -70,8 +71,18 @@ export function ReviewView({ health }: { health?: Health }) {
   const list = jobs ?? [];
   const pending = list.filter(isPendingReview);
   const working = list.filter((j) => j.state === "queued" || j.state === "running" || j.state === "paused");
+
+  // Failed jobs get their own section rather than being buried in History. A video that fails its
+  // own check is the one most likely to need a look — the check's one-line reason rarely says
+  // enough on its own — and it is kept watchable so the fault can be judged and fixed.
+  const failed = list.filter((j) => j.state === "failed");
   const settled = list.filter(
-    (j) => !isPendingReview(j) && j.state !== "queued" && j.state !== "running" && j.state !== "paused",
+    (j) =>
+      !isPendingReview(j) &&
+      j.state !== "queued" &&
+      j.state !== "running" &&
+      j.state !== "paused" &&
+      j.state !== "failed",
   );
 
   const authErrorJobs = list.filter(
@@ -252,6 +263,31 @@ export function ReviewView({ health }: { health?: Health }) {
         </section>
       )}
 
+      {/* Failed — kept out of History so a broken video is never mixed in with the published ones */}
+      {failed.length > 0 && (
+        <section className="space-y-4">
+          <SectionTitle
+            icon={<AlertTriangle className="size-4 text-destructive" />}
+            title="Failed"
+            count={failed.length}
+          />
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {failed.map((job) => (
+              <FailedCard
+                key={job.id}
+                job={job}
+                busy={
+                  (revoice.isPending && revoice.variables === job.id) ||
+                  (acceptCheck.isPending && acceptCheck.variables === job.id)
+                }
+                onRevoice={() => revoice.mutate(job.id)}
+                onAccept={() => acceptCheck.mutate(job.id)}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* History */}
       <section className="space-y-4">
         <div className="flex items-center justify-between">
@@ -345,6 +381,17 @@ function ReviewCard({
           <p className="truncate text-xs text-muted-foreground">{job.topic}</p>
         </div>
 
+        {/* Sent here despite its own check — say so, so approving it stays a deliberate choice. */}
+        {job.checkOverride && (
+          <p className="flex gap-1.5 rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] leading-snug text-muted-foreground">
+            <AlertTriangle className="mt-px size-3.5 shrink-0 text-destructive" />
+            <span className="whitespace-pre-line break-words">
+              You passed this despite its check:{"\n"}
+              {job.checkOverride.replace(/^The finished video did not pass.*?:\n/s, "")}
+            </span>
+          </p>
+        )}
+
         {(job.youTubeDescription || (job.youTubeTags && job.youTubeTags.length > 0)) && (
           <details className="group text-xs">
             <summary className="cursor-pointer list-none text-muted-foreground hover:text-foreground">
@@ -408,6 +455,93 @@ function ReviewCard({
   );
 }
 
+/**
+ * A job that failed, with the video it produced.
+ *
+ * The video is playable here even though it can never be published from this card: judging
+ * whether a fault is real means watching it, and the check's reason on its own ("Rows 178..254
+ * are drawn by two different slices") does not say which picture it happened to, or how bad it
+ * looks. Re-render puts it back through the pipeline once the cause is fixed.
+ */
+function FailedCard({
+  job,
+  busy,
+  onRevoice,
+  onAccept,
+}: {
+  job: Job;
+  busy: boolean;
+  onRevoice: () => void;
+  onAccept: () => void;
+}) {
+  // The check lists every fault on its own line; keep them all rather than collapsing to one.
+  const reason = job.error || job.uploadError || "Failed with no reason recorded.";
+  const videoRef = React.useRef<HTMLVideoElement>(null);
+
+  // Same full-screen path as the review card: a fault worth judging is usually too small to see
+  // in a card this size.
+  const goFullscreen = () => {
+    const el = videoRef.current;
+    if (!el) return;
+    const anyEl = el as HTMLVideoElement & { webkitEnterFullscreen?: () => void };
+    if (el.requestFullscreen) void el.requestFullscreen();
+    else anyEl.webkitEnterFullscreen?.();
+  };
+
+  return (
+    <Card className="flex flex-col overflow-hidden border-destructive/40">
+      {job.hasVideo ? (
+        <div className="group relative flex justify-center bg-black">
+          <video
+            ref={videoRef}
+            className="aspect-[9/16] max-h-[340px] w-auto object-contain"
+            src={videoUrl(job.id)}
+            poster={job.hasThumbnail ? thumbnailUrl(job.id) : undefined}
+            controls
+            playsInline
+            preload="metadata"
+            onDoubleClick={goFullscreen}
+          />
+          <button
+            type="button"
+            onClick={goFullscreen}
+            title="Full screen (or double-click the video)"
+            aria-label="Full screen"
+            className="absolute right-2 top-2 rounded-md bg-black/60 p-2 text-white opacity-0 transition-opacity hover:bg-black/80 focus-visible:opacity-100 group-hover:opacity-100"
+          >
+            <Maximize2 className="size-4" />
+          </button>
+        </div>
+      ) : (
+        <div className="flex aspect-[9/16] max-h-[180px] items-center justify-center bg-secondary text-xs text-muted-foreground">
+          No video was produced
+        </div>
+      )}
+      <CardContent className="flex flex-1 flex-col gap-3 pt-4">
+        <div className="flex items-start justify-between gap-2">
+          <p className="min-w-0 flex-1 truncate text-sm font-medium">
+            {job.youTubeTitle || job.title || job.topic}
+          </p>
+          <Badge variant="outline" className="shrink-0">{job.id}</Badge>
+        </div>
+        <p className="whitespace-pre-line break-words text-xs text-muted-foreground">{reason}</p>
+        <div className="mt-auto flex gap-2">
+          <Button variant="outline" size="sm" className="flex-1" disabled={busy} onClick={onRevoice}>
+            {busy ? <Spinner /> : <RefreshCw className="size-4" />} Re-render
+          </Button>
+          {/* The check errs towards failing. Watching it is the last word — but this only sends
+              it to the review queue; approving it is still a separate, deliberate press. */}
+          {job.hasVideo && (
+            <Button size="sm" className="flex-1" disabled={busy} onClick={onAccept}>
+              {busy ? <Spinner /> : <Check className="size-4" />} Looks fine
+            </Button>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 function HistoryRow({ job, busy, onRetry }: { job: Job; busy: boolean; onRetry: () => void }) {
   const dests = destinationStates(job);
   const rawError =
@@ -452,12 +586,85 @@ function HistoryRow({ job, busy, onRetry }: { job: Job; busy: boolean; onRetry: 
         )}
         <PlatformLink platform={job.facebook} label="Facebook" icon={<Facebook className="size-4" />} />
         <PlatformLink platform={job.instagram} label="Instagram" icon={<Instagram className="size-4" />} />
+        <DriveControl job={job} />
         <div className="shrink-0">
           <StatusBadge job={job} />
         </div>
       </CardContent>
     </Card>
   );
+}
+
+/**
+ * Where a finished video's files are: a transfer in progress, "In Drive" with Bring back, or a
+ * Move to Drive button while the files are still here. The server decides whether a move is
+ * allowed (never while a destination still needs the file) and says why not.
+ */
+function DriveControl({ job }: { job: Job }) {
+  const qc = useQueryClient();
+  const [error, setError] = React.useState<string | null>(null);
+  const onDone = {
+    onSuccess: () => {
+      setError(null);
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+      qc.invalidateQueries({ queryKey: ["drive"] });
+    },
+    onError: (e: unknown) =>
+      setError((e as { response?: { data?: { error?: string } } })?.response?.data?.error ?? "Couldn't start it."),
+  };
+  const move = useMutation({ mutationFn: () => api.moveToDrive(job.id), ...onDone });
+  const bringBack = useMutation({ mutationFn: () => api.bringBackFromDrive(job.id), ...onDone });
+  const problem = error ?? job.driveError ?? null;
+
+  if (job.driveTransfer)
+    return (
+      <Badge variant="secondary" className="shrink-0 gap-1">
+        <Spinner /> {job.driveTransfer === "moving" ? "Moving to Drive…" : "Bringing back…"}
+      </Badge>
+    );
+
+  if (job.driveRemote)
+    return (
+      <div className="flex shrink-0 items-center gap-1">
+        <Badge variant="default" className="gap-1" title={`${job.driveRemote} · frees ${formatMb(job.driveBytes)} here`}>
+          <Cloud className="size-3" /> In Drive
+        </Badge>
+        <Button
+          variant="ghost"
+          size="icon"
+          title={problem ? `Bring back failed: ${problem}` : "Bring back to this PC"}
+          disabled={bringBack.isPending}
+          onClick={() => bringBack.mutate()}
+        >
+          {bringBack.isPending ? <Spinner /> : <CloudDownload className={`size-4 ${problem ? "text-amber-400" : ""}`} />}
+        </Button>
+      </div>
+    );
+
+  if (!job.hasVideo) return null;
+  return (
+    <Button
+      variant="ghost"
+      size="icon"
+      className="shrink-0"
+      title={problem ? `Last move failed (nothing was deleted): ${problem}` : "Move to Google Drive"}
+      disabled={move.isPending}
+      onClick={() => {
+        if (
+          window.confirm(
+            "Move this video to Google Drive?\n\nIt's uploaded and checked file by file first; only then are its files removed from this PC. Bring back copies it home again.",
+          )
+        )
+          move.mutate();
+      }}
+    >
+      {move.isPending ? <Spinner /> : <CloudUpload className={`size-4 ${problem ? "text-amber-400" : ""}`} />}
+    </Button>
+  );
+}
+
+function formatMb(bytes: number): string {
+  return bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB` : `${Math.round(bytes / 1024 ** 2)} MB`;
 }
 
 /**

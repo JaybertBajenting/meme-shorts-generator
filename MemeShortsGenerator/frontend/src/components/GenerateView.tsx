@@ -11,6 +11,7 @@ import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Badge } from "@/components/ui/badge";
+import { ListBatchCard } from "@/components/ListBatchCard";
 
 const FORMATS = [
   { value: "", label: "Auto (let Codex choose)" },
@@ -28,7 +29,7 @@ const MODE_COPY: Record<string, { icon: typeof Wand2; blurb: string }> = {
   meme: { icon: Wand2, blurb: "Codex writes the script and draws the artwork from a topic." },
   repost: { icon: ImagePlus, blurb: "You paste a screenshot. It gets read out word for word." },
   finance: { icon: TrendingUp, blurb: "Codex writes it, rendered with data visuals." },
-  list: { icon: Layers, blurb: "A run of pictures, one line of script each, read over gameplay." },
+  list: { icon: Layers, blurb: "Fast photos or clips, one spoken beat each, over blurred gameplay." },
 };
 
 /**
@@ -36,12 +37,21 @@ const MODE_COPY: Record<string, { icon: typeof Wand2; blurb: string }> = {
  * text before the generic line.
  *
  * Batch submits catch each picture's failure and rethrow it as a plain Error, which has no
- * axios `response` â€” so a perfectly clear "Already made a video from â€¦" was being reported as
+ * axios `response` — so a perfectly clear "Already made a video from …" was being reported as
  * "Is the API running?", sending everyone to check a server that was fine.
  */
 function errMsg(e: unknown, fallback: string): string {
-  const anyE = e as { response?: { data?: { error?: string } }; message?: string };
-  return anyE?.response?.data?.error ?? (anyE?.message || undefined) ?? fallback;
+  const anyE = e as {
+    response?: { data?: { error?: string; detail?: string; title?: string } };
+    message?: string;
+  };
+  return (
+    anyE?.response?.data?.error ??
+    anyE?.response?.data?.detail ??
+    anyE?.response?.data?.title ??
+    (anyE?.message || undefined) ??
+    fallback
+  );
 }
 
 export function GenerateView({ health }: { health?: Health }) {
@@ -55,11 +65,11 @@ export function GenerateView({ health }: { health?: Health }) {
   const [count, setCount] = React.useState<number>(3);
   const [lastBatch, setLastBatch] = React.useState<{ id: string; topic: string }[] | null>(null);
 
-  // Repost channels take a post you found instead of a topic â€” no Codex, no image generation.
+  // Repost channels take a post you found instead of a topic — no Codex, no image generation.
   const [postText, setPostText] = React.useState<string>("");
   const [postTitle, setPostTitle] = React.useState<string>("");
   // A STAGING LIST, not one picture. Screenshots get collected a few at a time, and each one
-  // becomes its own video â€” so pasting a second must add to the pile rather than replace it.
+  // becomes its own video — so pasting a second must add to the pile rather than replace it.
   const [postImages, setPostImages] = React.useState<File[]>([]);
   const [postPreviews, setPostPreviews] = React.useState<string[]>([]);
   const [dragging, setDragging] = React.useState(false);
@@ -97,7 +107,7 @@ export function GenerateView({ health }: { health?: Health }) {
   const isList = contentType === "list";
   const usesPictures = isRepost || isList;
 
-  // One line of script per picture â€” the format pairs them, so a mismatch is worth catching
+  // One line of script per picture — the format pairs them, so a mismatch is worth catching
   // in the form rather than as a server error after the upload.
   const [listLines, setListLines] = React.useState<string>("");
   const scriptLines = listLines
@@ -106,7 +116,7 @@ export function GenerateView({ health }: { health?: Health }) {
     .map((l) => l.trim())
     .filter((l) => l.length > 0);
 
-  // Ctrl+V anywhere on the page. Screenshotting a post and pasting it is the whole workflow â€”
+  // Ctrl+V anywhere on the page. Screenshotting a post and pasting it is the whole workflow —
   // routing that through a file picker would mean saving to disk first for no reason.
   React.useEffect(() => {
     if (!usesPictures) return;
@@ -134,7 +144,7 @@ export function GenerateView({ health }: { health?: Health }) {
   }, [postImages]);
 
   // Read the words off the picture as soon as it lands, so they don't have to be retyped.
-  // The result is a DRAFT â€” it fills the box for correction, and never overwrites typing
+  // The result is a DRAFT — it fills the box for correction, and never overwrites typing
   // already in progress.
   const ocr = useMutation({
     mutationFn: (file: File) => api.ocr(file),
@@ -147,7 +157,7 @@ export function GenerateView({ health }: { health?: Health }) {
 
   // The paste listener is registered once (its effect only depends on isRepost), so it closes
   // over whatever `autofill` was at subscribe time. A ref keeps the handler reading the CURRENT
-  // value â€” without it, flipping the toggle had no effect until the view remounted.
+  // value — without it, flipping the toggle had no effect until the view remounted.
   const autofillRef = React.useRef(autofill);
   React.useEffect(() => {
     autofillRef.current = autofill;
@@ -178,9 +188,11 @@ export function GenerateView({ health }: { health?: Health }) {
     if (files.length === 0) return;
     setPostImages((prev) => {
       const next = [...prev, ...files];
-      // Only prefill for a lone picture â€” the text box cannot describe a pile of them, and
+      // Only prefill for a lone picture — the text box cannot describe a pile of them, and
       // whole-image OCR also picks up the username row, so it fills the box with junk to clear.
-      if (next.length === 1 && autofillRef.current) ocr.mutate(next[0]);
+      if (next.length === 1 && next[0].type.startsWith("image/") && autofillRef.current) {
+        ocr.mutate(next[0]);
+      }
       return next;
     });
     resetFileInput();
@@ -188,11 +200,11 @@ export function GenerateView({ health }: { health?: Health }) {
 
   // Why "Make the video" is unavailable, in the user's terms. Null means it is ready to go.
   const blockedReason = settings?.generationPaused
-    ? "Generation is paused â€” hit Resume generation at the top first."
+    ? "Generation is paused — hit Resume generation at the top first."
     : ocr.isPending
-      ? "Still reading the pictureâ€¦"
+      ? "Still reading the picture…"
       : postImages.length === 0 && !postText.trim()
-        // A picture alone is enough â€” its words are read off it. The text box is only the
+        // A picture alone is enough — its words are read off it. The text box is only the
         // correction path for when OCR gets them wrong.
         ? "Paste a picture, or type the post text."
         : null;
@@ -202,13 +214,13 @@ export function GenerateView({ health }: { health?: Health }) {
   const listBlockedReason = settings?.generationPaused
     ? "Generation is paused — hit Resume generation at the top first."
     : postImages.length === 0
-      ? "Add the pictures, in the order they should play."
+      ? "Add the photos or clips, in the order they should play."
       : scriptLines.length === 0
-        ? "Write one line of script per picture."
+        ? "Write one line of script per media item."
         : scriptLines.length !== postImages.length
           ? scriptLines.length < postImages.length
-            ? `${postImages.length - scriptLines.length} picture(s) have no line yet.`
-            : `${scriptLines.length - postImages.length} line(s) have no picture yet.`
+            ? `${postImages.length - scriptLines.length} media item(s) have no line yet.`
+            : `${scriptLines.length - postImages.length} line(s) have no media yet.`
           : null;
 
   const invalidate = () => {
@@ -221,19 +233,150 @@ export function GenerateView({ health }: { health?: Health }) {
   type DraftItem = {
     text: string;
     term: string;
+    /** "object" / "scene" are drawn by Codex first; "real" is a real photo first. */
+    kind?: string | null;
     file: string | null;
     credit: string | null;
     /** Commons page title — what identifies the picture, so a swap can avoid repeats. */
     source: string | null;
     url: string | null;
+    error?: string | null;
   };
-  const [draft, setDraft] = React.useState<{ id: string; title: string; items: DraftItem[] } | null>(null);
+  type ListDraft = { id: string; title: string; items: DraftItem[] };
+  const [draft, setDraft] = React.useState<ListDraft | null>(null);
   const [swapping, setSwapping] = React.useState<number | null>(null);
+  const [autoFilling, setAutoFilling] = React.useState<Set<number>>(() => new Set());
+  const autoFillAbort = React.useRef<AbortController | null>(null);
+
+  const autoFillMissingImages = React.useCallback(async (nextDraft: ListDraft) => {
+    // A line with the same term as the one before HOLDS that picture - the sentence is still on
+    // the same thing - so only the first line of each run is fetched, and its picture goes to
+    // every line in the run.
+    const runOf = (index: number) => {
+      const members = [index];
+      const term = nextDraft.items[index].term.trim().toLowerCase();
+      for (let k = index + 1; k < nextDraft.items.length; k++) {
+        if (nextDraft.items[k].term.trim().toLowerCase() !== term) break;
+        members.push(k);
+      }
+      return members;
+    };
+    const heads = nextDraft.items
+      .map((_, index) => index)
+      .filter(
+        (index) =>
+          !nextDraft.items[index].file &&
+          (index === 0 ||
+            nextDraft.items[index].term.trim().toLowerCase() !==
+              nextDraft.items[index - 1].term.trim().toLowerCase()),
+      );
+    if (heads.length === 0) return;
+
+    autoFillAbort.current?.abort();
+    const controller = new AbortController();
+    autoFillAbort.current = controller;
+    setAutoFilling(new Set(heads.flatMap(runOf)));
+
+    const used = new Set(
+      nextDraft.items.map((item) => item.source).filter((source): source is string => Boolean(source)),
+    );
+
+    const fill = async (index: number) => {
+      const item = nextDraft.items[index];
+      const run = runOf(index);
+      try {
+        const res = await api.listDraftImage(
+          nextDraft.id,
+          { index, term: item.term, exclude: Array.from(used), kind: item.kind ?? null },
+          controller.signal,
+        );
+        if (res.source) used.add(res.source);
+        setDraft((current) =>
+          current?.id === nextDraft.id
+            ? {
+                ...current,
+                items: current.items.map((currentItem, itemIndex) =>
+                  run.includes(itemIndex)
+                    ? {
+                        ...currentItem,
+                        file: res.file,
+                        url: res.url ?? null,
+                        credit: res.credit ?? null,
+                        source: res.source ?? null,
+                        error: res.file ? null : (res.message ?? "Codex could not create this image."),
+                      }
+                    : currentItem,
+                ),
+              }
+            : current,
+        );
+      } catch (e) {
+        const cancelled =
+          (e as { name?: string; code?: string })?.name === "CanceledError" ||
+          (e as { code?: string })?.code === "ERR_CANCELED";
+        if (!cancelled) {
+          setDraft((current) =>
+            current?.id === nextDraft.id
+              ? {
+                  ...current,
+                  items: current.items.map((currentItem, itemIndex) =>
+                    run.includes(itemIndex) ? { ...currentItem, error: errMsg(e, "Image creation failed.") } : currentItem,
+                  ),
+                }
+              : current,
+          );
+        }
+      } finally {
+        setAutoFilling((current) => {
+          const remaining = new Set(current);
+          run.forEach((k) => remaining.delete(k));
+          return remaining;
+        });
+      }
+    };
+
+    // Three at a time. Most pictures are drawn now, at a minute or two each; one after another a
+    // 13-picture draft took the best part of twenty minutes to fill.
+    const queue = [...heads];
+    const worker = async () => {
+      while (queue.length > 0 && !controller.signal.aborted) {
+        await fill(queue.shift()!);
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]);
+
+    if (autoFillAbort.current === controller) autoFillAbort.current = null;
+  }, []);
+
+  React.useEffect(
+    () => () => {
+      autoFillAbort.current?.abort();
+    },
+    [],
+  );
 
   const suggest = useMutation({
     mutationFn: () => api.listDraft({ topic: topic.trim() || null, channel: channel || null }),
-    onSuccess: (d) => setDraft(d),
+    onSuccess: (d) => {
+      setDraft(d);
+      void autoFillMissingImages(d);
+    },
   });
+  const [suggestSeconds, setSuggestSeconds] = React.useState(0);
+
+  React.useEffect(() => {
+    if (!suggest.isPending) {
+      setSuggestSeconds(0);
+      return;
+    }
+
+    const started = Date.now();
+    const timer = window.setInterval(
+      () => setSuggestSeconds(Math.floor((Date.now() - started) / 1000)),
+      1000,
+    );
+    return () => window.clearInterval(timer);
+  }, [suggest.isPending]);
 
   const confirmDraft = useMutation({
     mutationFn: () =>
@@ -252,11 +395,13 @@ export function GenerateView({ health }: { health?: Health }) {
   /** Re-search one line's picture with whatever term is in its box now. */
   const swapImage = async (index: number, term: string) => {
     if (!draft || !term.trim()) return;
+    const draftId = draft.id;
     setSwapping(index);
     try {
-      const res = await api.listDraftImage(draft.id, {
+      const res = await api.listDraftImage(draftId, {
         index,
         term: term.trim(),
+        kind: draft.items[index]?.kind ?? null,
         // Everything the other lines are using, so the swap can't hand back a picture that is
         // already on screen somewhere else in this video.
         exclude: draft.items
@@ -264,7 +409,7 @@ export function GenerateView({ health }: { health?: Health }) {
           .map((it) => it.source!),
       });
       setDraft((d) =>
-        d === null
+        d?.id !== draftId
           ? d
           : {
               ...d,
@@ -277,6 +422,7 @@ export function GenerateView({ health }: { health?: Health }) {
                       url: res.url ?? null,
                       credit: res.credit ?? null,
                       source: res.source ?? null,
+                      error: res.file ? null : (res.message ?? "Codex could not create this image."),
                     }
                   : it,
               ),
@@ -322,7 +468,7 @@ export function GenerateView({ health }: { health?: Health }) {
   const repost = useMutation({
     // One job per staged picture, submitted one at a time. A failure on any single picture is
     // collected rather than thrown, so one unreadable screenshot cannot strand the rest of the
-    // pile unqueued â€” the pipeline itself already runs the jobs serially from here.
+    // pile unqueued — the pipeline itself already runs the jobs serially from here.
     mutationFn: async () => {
       const images: (File | null)[] = postImages.length > 0 ? postImages : [null];
       const failures: string[] = [];
@@ -381,7 +527,7 @@ export function GenerateView({ health }: { health?: Health }) {
           </Button>
         </div>
       )}
-      {/* What kind of video â€” the FIRST decision, so it sits at the top. This used to live in
+      {/* What kind of video — the FIRST decision, so it sits at the top. This used to live in
           the "Settings" card at the bottom of the page, where it was invisible: you had to
           scroll past both generator cards to find it, and the card's title made it look like
           it belonged to the Settings tab. */}
@@ -392,8 +538,8 @@ export function GenerateView({ health }: { health?: Health }) {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          {/* Buttons, not a dropdown. Picking this changes the entire page â€” which form you get,
-              whether Codex runs at all â€” and a collapsed <select> showed only the current value,
+          {/* Buttons, not a dropdown. Picking this changes the entire page — which form you get,
+              whether Codex runs at all — and a collapsed <select> showed only the current value,
               so there was no way to tell the other modes existed. */}
           <div className="grid gap-3 sm:grid-cols-3">
             {(channels ?? []).map((c: Channel) => {
@@ -424,7 +570,11 @@ export function GenerateView({ health }: { health?: Health }) {
         </CardContent>
       </Card>
 
-      {/* List short: pictures in order, one line of script each. Both halves are supplied, so
+      {/* Hands-off: N list videos in one click, made on the server. First, because it is the
+          everyday way to fill the Review tab; the hand-built form below is for one-offs. */}
+      {isList && <ListBatchCard channel={channel} paused={settings?.generationPaused} />}
+
+      {/* List short: media in order, one line of script each. Both halves are supplied, so
           like the repost form this replaces the topic and batch cards entirely. */}
       {isList && (
         <Card className="border-primary/30 lg:col-span-2">
@@ -433,14 +583,14 @@ export function GenerateView({ health }: { health?: Health }) {
               <Layers className="size-5 text-primary" /> Build a list short
             </CardTitle>
             <CardDescription>
-              Pictures in order, one line of script each. Each picture is on screen while its line
-              is read, over blurred gameplay with the words drawn on top.
+              Photos or short clips in order, one line of script each. Each item plays while its
+              line is read, over blurred gameplay with rapid captions on top.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-2">
               <div className="flex items-center justify-between gap-2">
-                <Label>Pictures — in order</Label>
+                <Label>Photos or clips — in order</Label>
                 {postImages.length > 0 && (
                   <div className="flex items-center gap-3 text-xs">
                     <span
@@ -450,7 +600,7 @@ export function GenerateView({ health }: { health?: Health }) {
                           : "text-amber-300"
                       }
                     >
-                      {postImages.length} picture{postImages.length === 1 ? "" : "s"} ·{" "}
+                      {postImages.length} item{postImages.length === 1 ? "" : "s"} ·{" "}
                       {scriptLines.length} line{scriptLines.length === 1 ? "" : "s"}
                     </span>
                     <button
@@ -472,7 +622,11 @@ export function GenerateView({ health }: { health?: Health }) {
                 onDrop={(e) => {
                   e.preventDefault();
                   setDragging(false);
-                  addImages(Array.from(e.dataTransfer.files).filter((x) => x.type.startsWith("image/")));
+                  addImages(
+                    Array.from(e.dataTransfer.files).filter(
+                      (x) => x.type.startsWith("image/") || x.type.startsWith("video/"),
+                    ),
+                  );
                 }}
                 onClick={() => imageInput.current?.click()}
                 className={`relative flex cursor-pointer flex-col items-center justify-center gap-3 rounded-md border-2 border-dashed p-6 text-center transition-colors ${
@@ -484,11 +638,22 @@ export function GenerateView({ health }: { health?: Health }) {
                     {postImages.map((file, i) =>
                       postPreviews[i] ? (
                         <div key={`${file.name}-${file.lastModified}-${i}`} className="group relative">
-                          <img
-                            src={postPreviews[i]}
-                            alt={file.name}
-                            className="h-28 w-full rounded border border-border bg-background object-contain"
-                          />
+                          {file.type.startsWith("video/") ? (
+                            <video
+                              src={postPreviews[i]}
+                              aria-label={file.name}
+                              muted
+                              playsInline
+                              preload="metadata"
+                              className="h-28 w-full rounded border border-border bg-background object-contain"
+                            />
+                          ) : (
+                            <img
+                              src={postPreviews[i]}
+                              alt={file.name}
+                              className="h-28 w-full rounded border border-border bg-background object-contain"
+                            />
+                          )}
                           {/* The number is the running order, and the line it pairs with. */}
                           <span className="absolute left-1 top-1 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-medium text-white">
                             {i + 1}
@@ -513,7 +678,7 @@ export function GenerateView({ health }: { health?: Health }) {
                   <ImagePlus className="size-7 text-muted-foreground" />
                   <p className="text-sm font-medium">
                     Press <kbd className="rounded bg-secondary px-1.5 py-0.5 text-xs">Ctrl</kbd>{" "}
-                    <kbd className="rounded bg-secondary px-1.5 py-0.5 text-xs">V</kbd> to paste a picture
+                    <kbd className="rounded bg-secondary px-1.5 py-0.5 text-xs">V</kbd> to paste a photo
                   </p>
                   <p className="text-xs text-muted-foreground">
                     or drop them here, or click to browse — they play in the order shown
@@ -524,14 +689,14 @@ export function GenerateView({ health }: { health?: Health }) {
                 ref={imageInput}
                 type="file"
                 multiple
-                accept="image/png,image/jpeg,image/webp,image/gif"
+                accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,video/quicktime,video/x-m4v"
                 className="hidden"
                 onChange={(e) => addImages(Array.from(e.target.files ?? []))}
               />
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="list-lines">Script — one line per picture</Label>
+              <Label htmlFor="list-lines">Script — one line per media item</Label>
               <textarea
                 id="list-lines"
                 rows={7}
@@ -541,7 +706,7 @@ export function GenerateView({ health }: { health?: Health }) {
                 className="flex w-full rounded-md border border-input bg-background/40 px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               />
               <p className="text-xs text-muted-foreground">
-                Line 1 is read over picture 1, line 2 over picture 2, and so on. Blank lines are
+                Line 1 is read over item 1, line 2 over item 2, and so on. Blank lines are
                 ignored, so the counts have to match.
               </p>
             </div>
@@ -572,13 +737,19 @@ export function GenerateView({ health }: { health?: Health }) {
                 />
                 <Button
                   variant="secondary"
-                  disabled={suggest.isPending}
+                  disabled={suggest.isPending || autoFilling.size > 0}
                   onClick={() => suggest.mutate()}
                 >
                   {suggest.isPending ? <Spinner /> : <Wand2 className="size-4" />}
-                  {suggest.isPending ? "Writing…" : "Suggest"}
+                  {suggest.isPending ? "Building draft…" : "Suggest"}
                 </Button>
               </div>
+              {suggest.isPending && (
+                <p className="text-xs text-muted-foreground" role="status">
+                  {suggestSeconds}s elapsed — writing the script, then looking for exact Wikimedia
+                  matches. If one is missing, the draft opens first and Codex creates it visibly.
+                </p>
+              )}
               {suggest.isError && (
                 <p className="text-sm text-destructive">
                   {errMsg(suggest.error, "Codex couldn't come up with one.")}
@@ -587,11 +758,26 @@ export function GenerateView({ health }: { health?: Health }) {
 
               {draft && (
                 <div className="space-y-3">
+                  {autoFilling.size > 0 && (
+                    <p className="flex items-center gap-2 text-xs text-muted-foreground" role="status">
+                      <Spinner /> Codex is creating {autoFilling.size} missing visual
+                      {autoFilling.size === 1 ? "" : "s"}, three at a time.
+                    </p>
+                  )}
                   <div className="flex items-center justify-between gap-2">
-                    <p className="text-sm font-semibold">{draft.title}</p>
+                    <Input
+                      aria-label="Draft YouTube title"
+                      value={draft.title}
+                      onChange={(e) => setDraft({ ...draft, title: e.target.value })}
+                      className="h-8 max-w-xl font-semibold"
+                    />
                     <button
                       type="button"
-                      onClick={() => setDraft(null)}
+                      onClick={() => {
+                        autoFillAbort.current?.abort();
+                        setAutoFilling(new Set());
+                        setDraft(null);
+                      }}
                       className="text-xs text-muted-foreground underline-offset-2 hover:text-destructive hover:underline"
                     >
                       discard
@@ -617,15 +803,34 @@ export function GenerateView({ health }: { health?: Health }) {
                             )}
                           </div>
                         ) : (
-                          // Say WHICH line has no picture, and what will happen if it is left
-                          // that way — the line is kept and the previous picture is held over.
                           <div className="flex h-20 w-28 items-center justify-center rounded border border-dashed border-amber-500/60 p-1 text-center text-[10px] leading-tight text-amber-300">
-                            {i === 0 ? "no picture found" : "none — holds the one above"}
+                            {autoFilling.has(i)
+                              ? "Codex is creating this image…"
+                              : item.error
+                                ? "creation failed — edit the search and retry"
+                                : "no exact image found"}
                           </div>
                         )}
                       </div>
                       <div className="min-w-0 flex-1 space-y-1">
-                        <p className="text-sm">{item.text}</p>
+                        <textarea
+                          aria-label={`Spoken line ${i + 1}`}
+                          rows={2}
+                          value={item.text}
+                          onChange={(e) =>
+                            setDraft((d) =>
+                              d === null
+                                ? d
+                                : {
+                                    ...d,
+                                    items: d.items.map((it, n) =>
+                                      n === i ? { ...it, text: e.target.value } : it,
+                                    ),
+                                  },
+                            )
+                          }
+                          className="flex w-full resize-y rounded-md border border-input bg-background/50 px-2 py-1 text-sm leading-snug ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        />
                         <div className="flex gap-1">
                           <Input
                             value={item.term}
@@ -647,10 +852,10 @@ export function GenerateView({ health }: { health?: Health }) {
                             size="sm"
                             variant="secondary"
                             className="h-8"
-                            disabled={swapping === i}
+                            disabled={swapping === i || autoFilling.has(i)}
                             onClick={() => swapImage(i, item.term)}
                           >
-                            {swapping === i ? <Spinner /> : "Search"}
+                            {swapping === i || autoFilling.has(i) ? <Spinner /> : "Search"}
                           </Button>
                         </div>
                       </div>
@@ -659,11 +864,21 @@ export function GenerateView({ health }: { health?: Health }) {
 
                   <Button
                     className="w-full"
-                    disabled={confirmDraft.isPending || draft.items.every((i) => !i.file)}
+                    disabled={
+                      confirmDraft.isPending || autoFilling.size > 0 || draft.items.some((i) => !i.file)
+                    }
                     onClick={() => confirmDraft.mutate()}
                   >
-                    {confirmDraft.isPending ? <Spinner /> : <Play className="size-4" />}
-                    Make this video
+                    {confirmDraft.isPending || autoFilling.size > 0 ? (
+                      <Spinner />
+                    ) : (
+                      <Play className="size-4" />
+                    )}
+                    {confirmDraft.isPending
+                      ? "Queueing…"
+                      : autoFilling.size > 0
+                        ? `Creating ${autoFilling.size} missing visual${autoFilling.size === 1 ? "" : "s"}…`
+                        : "Make this video"}
                   </Button>
                   {confirmDraft.isError && (
                     <p className="text-sm text-destructive">
@@ -703,7 +918,7 @@ export function GenerateView({ health }: { health?: Health }) {
       )}
 
       {/* Repost: you supply the post. Replaces both Codex cards, because neither a topic nor a
-          batch means anything here â€” the post IS the content. */}
+          batch means anything here — the post IS the content. */}
       {isRepost && (
         <Card className="border-primary/30 lg:col-span-2">
           <CardHeader>
@@ -712,7 +927,7 @@ export function GenerateView({ health }: { health?: Health }) {
             </CardTitle>
             <CardDescription>
               Drop in the picture and paste the words. The voice reads the text out verbatim and it
-              appears one line at a time over the background â€” no Codex, no generated artwork.
+              appears one line at a time over the background — no Codex, no generated artwork.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -722,7 +937,7 @@ export function GenerateView({ health }: { health?: Health }) {
                 {postImages.length > 0 && (
                   <div className="flex items-center gap-3 text-xs">
                     <span className="text-muted-foreground">
-                      {postImages.length} queued â€” one video each
+                      {postImages.length} queued — one video each
                     </span>
                     <button
                       type="button"
@@ -751,7 +966,7 @@ export function GenerateView({ health }: { health?: Health }) {
                 }`}
               >
                 {/* Zip against the previews rather than indexing them. The preview URLs are
-                    derived in an effect, so they survive one render longer than the files do â€”
+                    derived in an effect, so they survive one render longer than the files do —
                     on a successful submit the files clear first, and reading .size off a stale
                     index there crashed the whole page to blank. */}
                 {postImages.length > 0 && (
@@ -793,7 +1008,7 @@ export function GenerateView({ health }: { health?: Health }) {
                     {postImages.length > 0 ? " another screenshot" : " your screenshot"}
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    or drop them here, or click to browse â€” add as many as you like
+                    or drop them here, or click to browse — add as many as you like
                   </p>
                 </div>
               </div>
@@ -813,7 +1028,7 @@ export function GenerateView({ health }: { health?: Health }) {
                 <div className="flex items-center gap-2">
                   {ocr.isPending && (
                     <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                      <Spinner /> reading the pictureâ€¦
+                      <Spinner /> reading the picture…
                     </span>
                   )}
                   {postImages.length === 1 && !ocr.isPending && (
@@ -831,7 +1046,7 @@ export function GenerateView({ health }: { health?: Health }) {
                 id="post-text"
                 rows={8}
                 disabled={isBatch}
-                placeholder={"Paste a picture above and its words land here automatically.\n\nOr type them yourself. Blank lines separate paragraphs â€” each one gets the wider gap, exactly like the original."}
+                placeholder={"Paste a picture above and its words land here automatically.\n\nOr type them yourself. Blank lines separate paragraphs — each one gets the wider gap, exactly like the original."}
                 value={postText}
                 onChange={(e) => setPostText(e.target.value)}
                 className="flex w-full rounded-md border border-input bg-background/40 px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
@@ -839,7 +1054,7 @@ export function GenerateView({ health }: { health?: Health }) {
               <p className="text-xs text-muted-foreground">
                 {isBatch
                   ? "With several pictures queued there's no way to say which post this belongs to, so every one is read straight off its own picture. Queue a single picture to correct its words."
-                  : "Leave this empty and each line is read straight off the picture. Fill it in only to correct a word â€” it changes the voiceover, never what's on screen."}
+                  : "Leave this empty and each line is read straight off the picture. Fill it in only to correct a word — it changes the voiceover, never what's on screen."}
               </p>
 
               <label className="flex cursor-pointer items-center gap-2 pt-1 text-xs text-muted-foreground">
@@ -859,7 +1074,7 @@ export function GenerateView({ health }: { health?: Health }) {
               <Input
                 id="post-title"
                 disabled={isBatch}
-                placeholder="Leave blank â€” Codex writes one in the channel's style"
+                placeholder="Leave blank — Codex writes one in the channel's style"
                 value={postTitle}
                 onChange={(e) => setPostTitle(e.target.value)}
               />
@@ -879,14 +1094,14 @@ export function GenerateView({ health }: { health?: Health }) {
               {repost.isPending ? <Spinner /> : <ImagePlus className="size-4" />}
               {repost.isPending
                 ? isBatch
-                  ? `Queueing ${(batchDone ?? 0) + 1} of ${postImages.length}â€¦`
-                  : "Uploadingâ€¦"
+                  ? `Queueing ${(batchDone ?? 0) + 1} of ${postImages.length}…`
+                  : "Uploading…"
                 : isBatch
                   ? `Make ${postImages.length} videos`
                   : "Make the video"}
             </Button>
 
-            {/* A disabled button with no explanation just reads as broken â€” say what is missing. */}
+            {/* A disabled button with no explanation just reads as broken — say what is missing. */}
             {blockedReason && !repost.isPending && (
               <p className="text-center text-sm text-amber-300">{blockedReason}</p>
             )}
@@ -895,8 +1110,8 @@ export function GenerateView({ health }: { health?: Health }) {
               <div className="space-y-1">
                 <p className="text-sm text-success">
                   {repost.data.queued === 1
-                    ? "Queued â€” see the Review tab."
-                    : `${repost.data.queued} queued â€” they build one at a time. See the Review tab.`}
+                    ? "Queued — see the Review tab."
+                    : `${repost.data.queued} queued — they build one at a time. See the Review tab.`}
                 </p>
                 {/* A picture that failed must be named, or it looks like it queued with the rest. */}
                 {repost.data.failures.length > 0 && (
@@ -965,7 +1180,7 @@ export function GenerateView({ health }: { health?: Health }) {
             onClick={() => auto.mutate()}
           >
             {auto.isPending ? <Spinner /> : <Sparkles className="size-4" />}
-            {auto.isPending ? "Thinking of topicsâ€¦" : `Generate ${count} video${count > 1 ? "s" : ""}`}
+            {auto.isPending ? "Thinking of topics…" : `Generate ${count} video${count > 1 ? "s" : ""}`}
           </Button>
 
           {auto.isError && (
@@ -1023,10 +1238,10 @@ export function GenerateView({ health }: { health?: Health }) {
             onClick={() => single.mutate()}
           >
             {single.isPending ? <Spinner /> : <Send className="size-4" />}
-            {single.isPending ? "Queuingâ€¦" : "Generate short"}
+            {single.isPending ? "Queuing…" : "Generate short"}
           </Button>
           {single.isSuccess && (
-            <p className="text-sm text-success">Queued â€” see the Review tab.</p>
+            <p className="text-sm text-success">Queued — see the Review tab.</p>
           )}
           {single.isError && (
             <p className="text-sm text-destructive">
@@ -1043,7 +1258,7 @@ export function GenerateView({ health }: { health?: Health }) {
           <CardTitle>Settings</CardTitle>
         </CardHeader>
         <CardContent className="grid gap-4 sm:grid-cols-2">
-          {/* Formats are hints passed to Codex, and reposts never reach Codex â€” showing the
+          {/* Formats are hints passed to Codex, and reposts never reach Codex — showing the
               dropdown there would imply a choice that does nothing. */}
           {!usesPictures && (
             <div className="space-y-2">
@@ -1079,7 +1294,7 @@ function UploadNotice({ health }: { health?: Health }) {
   if (destinations.length === 0)
     return (
       <p className="text-sm text-amber-400">
-        âš  No upload destination is configured â€” approved videos can't be posted anywhere yet (add
+        âš  No upload destination is configured — approved videos can't be posted anywhere yet (add
         YouTube OAuth client secrets, or Facebook/Instagram credentials). You can still generate
         and review.
       </p>
@@ -1099,7 +1314,7 @@ function UploadNotice({ health }: { health?: Health }) {
       <div className="space-y-1">
         <p className="text-sm text-amber-400">
           âš  {off.join(" and ")} {off.length === 1 ? "has" : "have"} saved credentials but{" "}
-          {off.length === 1 ? "is" : "are"} switched <strong>off</strong> â€” approved videos go to{" "}
+          {off.length === 1 ? "is" : "are"} switched <strong>off</strong> — approved videos go to{" "}
           {list || "nowhere"} only. Turn {off.length === 1 ? "it" : "them"} on in Settings.
         </p>
       </div>

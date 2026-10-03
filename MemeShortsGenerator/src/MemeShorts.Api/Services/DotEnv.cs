@@ -41,6 +41,9 @@ public static class DotEnv
         ["INSTAGRAM_ENABLED"] = "Instagram:Enabled",
         ["INSTAGRAM_USER_ID"] = "Instagram:IgUserId",
         ["INSTAGRAM_ACCESS_TOKEN"] = "Instagram:AccessToken",
+
+        // Stock photos looked up before Codex draws a picture (see StockPhotoSources).
+        ["PEXELS_API_KEY"] = "Pictures:PexelsApiKey",
     };
 
     /// <summary>

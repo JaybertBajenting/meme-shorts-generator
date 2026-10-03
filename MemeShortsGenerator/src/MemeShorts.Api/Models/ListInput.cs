@@ -18,6 +18,9 @@ public sealed class ListInput
 
     /// <summary>Sticker filename in the job dir that perches on the card, or null for none.</summary>
     [JsonPropertyName("mascot")] public string? Mascot { get; set; }
+
+    /// <summary>What the video is about, in a few words - kept so later scripts don't repeat it.</summary>
+    [JsonPropertyName("subject")] public string? Subject { get; set; }
 }
 
 public sealed class ListItem

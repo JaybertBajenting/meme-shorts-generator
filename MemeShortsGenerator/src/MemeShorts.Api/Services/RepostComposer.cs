@@ -156,7 +156,30 @@ public static class RepostComposer
             return (m.Groups["neg"].Success ? "minus " : "") + num + " " + unit;
         });
         s = Pictographs.Replace(s, " ");
+        s = Unshout(s);
         return Regex.Replace(s, @"\s+", " ").Trim();
+    }
+
+    /// <summary>
+    /// Take a SHOUTED line down to normal case before it is spoken.
+    ///
+    /// The voice reads an all-caps word as an initialism: "THE ALGORITHM:" came out of the
+    /// finished video as "The Algoramp". Meme text is written in caps from end to end, so the
+    /// caps carry nothing worth keeping - but SHORT all-caps tokens really are initialisms
+    /// ("AI", "CEO", the "WI" and "FI" of WI-FI), and those are left alone so they still get
+    /// spelled out. Only the audio is changed; the card still draws the post's own lettering.
+    /// </summary>
+    private static string Unshout(string s)
+    {
+        var letters = s.Where(char.IsLetter).ToArray();
+        if (letters.Length == 0) return s;
+
+        // A line that is not shouting keeps its own capitals - a normal sentence must not be
+        // flattened just because it opens with a capital.
+        if (letters.Count(char.IsUpper) < letters.Length * 0.8) return s;
+
+        return Regex.Replace(s, @"\p{L}[\p{L}']{3,}",
+            m => m.Value[0] + m.Value[1..].ToLowerInvariant());
     }
 
     /// <summary>The full verbatim narration for a wrapped post.</summary>
@@ -239,6 +262,28 @@ public static class RepostComposer
             else j++;
         }
 
+        // A line the transcript never matched still has to land somewhere sensible. Inheriting
+        // the previous line's timestamp put it on screen at the same instant as its neighbour,
+        // which is why such lines were being thrown away wholesale - and "Zucken-Musk:", a
+        // coinage the transcript spells its own way, is content, not chrome. An unmatched run
+        // is spread evenly between the anchors on either side of it instead.
+        for (int i = 0; i < lines.Count; i++)
+        {
+            if (anchors[i] is not null) continue;
+
+            int before = i - 1;
+            while (before >= 0 && anchors[before] is null) before--;
+            int after = i + 1;
+            while (after < lines.Count && anchors[after] is null) after++;
+
+            var from = before >= 0 ? anchors[before]!.Value : 0;
+            var to = after < lines.Count ? anchors[after]!.Value
+                   : heard.Count > 0 ? heard[^1].StartMs
+                   : from;
+            var run = after - before;
+            anchors[i] = run > 1 ? from + (to - from) * (i - before) / run : from;
+        }
+
         int last = 0;
         for (int i = 0; i < lines.Count; i++)
         {
@@ -253,6 +298,130 @@ public static class RepostComposer
         return Enumerable.Range(0, lines.Count)
             .Where(i => anchors[i] is null && Spoken(lines[i].Text).Trim().Length > 0)
             .ToList();
+    }
+
+    /// <summary>
+    /// Re-word each slice from the TYPED text, keeping one line per slice.
+    ///
+    /// The typed box holds the same post written correctly; the slicer holds it cut into the
+    /// bands the video reveals. They rarely agree on line COUNT - the box may carry five
+    /// paragraphs where the picture slices into twelve rows - so pairing them positionally
+    /// scatters the words across the wrong reveals, and refusing to pair them at all leaves the
+    /// voice reading raw OCR. Neither is acceptable: OCR reads "I'm" as "11m" and the narration
+    /// says "eleven-m deleting this app and".
+    ///
+    /// So they are matched by CONTENT. Each slice claims the span of typed words its own words
+    /// align to, and speaks the typed spelling of that span. A slice that matches nothing keeps
+    /// its own reading - the fallback is per slice, never for the whole post.
+    ///
+    /// Same longest-common-subsequence walk as <see cref="Align"/>, and for the same reason: a
+    /// greedy scan loses its place at the first misread word and never recovers.
+    /// </summary>
+    public static List<string> RewordFromTyped(
+        IReadOnlyList<string> sliceTexts, string typedText, out int matched,
+        out List<int> unmatched)
+    {
+        matched = 0;
+        unmatched = new List<int>();
+        var result = sliceTexts.ToList();
+        if (sliceTexts.Count == 0 || string.IsNullOrWhiteSpace(typedText)) return result;
+
+        var typedWords = typedText
+            .Replace("\r\n", " ").Replace('\n', ' ')
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (typedWords.Length == 0) return result;
+
+        var owners = new List<int>();
+        var tokens = new List<string>();
+        for (int i = 0; i < sliceTexts.Count; i++)
+            foreach (var w in (sliceTexts[i] ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries))
+            {
+                tokens.Add(Normalize(w));
+                owners.Add(i);
+            }
+
+        var typed = typedWords.Select(Normalize).ToList();
+        int n = tokens.Count, m = typed.Count;
+        if (n == 0) return result;
+
+        var dp = new int[n + 1, m + 1];
+        for (int i = n - 1; i >= 0; i--)
+            for (int j = m - 1; j >= 0; j--)
+                dp[i, j] = tokens[i].Length > 0 && tokens[i] == typed[j]
+                    ? dp[i + 1, j + 1] + 1
+                    : Math.Max(dp[i + 1, j], dp[i, j + 1]);
+
+        // First typed word each slice anchors to.
+        var firstTyped = new int?[sliceTexts.Count];
+        for (int i = 0, j = 0; i < n && j < m;)
+        {
+            if (tokens[i].Length > 0 && tokens[i] == typed[j])
+            {
+                firstTyped[owners[i]] ??= j;
+                i++; j++;
+            }
+            else if (dp[i + 1, j] >= dp[i, j + 1]) i++;
+            else j++;
+        }
+
+        // A slice owns from its own anchor up to the next anchored slice. Words the slice never
+        // matched - the "I'm" that OCR turned into "11m" - fall inside that span and are spoken.
+        var assigned = new bool[sliceTexts.Count];
+        for (int i = 0; i < sliceTexts.Count; i++)
+        {
+            if (firstTyped[i] is not { } start) continue;
+            var end = m;
+            for (int k = i + 1; k < sliceTexts.Count; k++)
+                if (firstTyped[k] is { } next) { end = next; break; }
+            if (end <= start) continue;
+
+            var words = typedWords[start..end];
+
+            // The slices that follow and matched nothing are usually this caption's LATER LINES,
+            // read so badly that not one word survived - the Pooh meme's "PAYEDJOIWORICOUT" for
+            // "PAYED TO WORK OUT". The give-away is that this slice's span holds far more words
+            // than the slice itself has: the surplus belongs to those lines. Sharing it out keeps
+            // the voice level with the reveal instead of reading all four lines on the first one.
+            //
+            // When there is no surplus the following slice really is something OCR invented off
+            // the picture, and it is left with nothing - which is how "AL", the Tarantino meme's
+            // misread "AI", stops being spoken as "ay-ell".
+            var run = new List<int> { i };
+            for (int k = i + 1; k < sliceTexts.Count && firstTyped[k] is null; k++) run.Add(k);
+            var own = (sliceTexts[i] ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+
+            if (run.Count > 1 && words.Length > own && words.Length >= run.Count)
+            {
+                var weights = run
+                    .Select(k => Math.Max(1, (sliceTexts[k] ?? "").Count(char.IsLetterOrDigit)))
+                    .ToList();
+                var totalWeight = (double)weights.Sum();
+                var at = 0;
+                for (int r = 0; r < run.Count; r++)
+                {
+                    var left = run.Count - 1 - r;
+                    var take = r == run.Count - 1
+                        ? words.Length - at
+                        : Math.Clamp((int)Math.Round(words.Length * weights[r] / totalWeight),
+                                     1, words.Length - at - left);
+                    result[run[r]] = string.Join(' ', words[at..(at + take)]).Trim();
+                    assigned[run[r]] = true;
+                    matched++;
+                    at += take;
+                }
+                i = run[^1];
+                continue;
+            }
+
+            result[i] = string.Join(' ', words).Trim();
+            assigned[i] = true;
+            matched++;
+        }
+
+        for (int i = 0; i < sliceTexts.Count; i++)
+            if (!assigned[i]) unmatched.Add(i);
+
+        return result;
     }
 
     private static string Normalize(string s)

@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Facebook, Instagram, CheckCircle2, AlertCircle, RotateCcw, Save, Mic } from "lucide-react";
+import { Facebook, Instagram, CheckCircle2, AlertCircle, RotateCcw, Save, Mic, Cloud, CloudUpload } from "lucide-react";
 import { api, type MetaPlatformSettings } from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -55,6 +55,8 @@ export function SettingsView() {
       </div>
 
       <VoiceCard />
+
+      <DriveCard />
 
       <PlatformCard
         title="Facebook Page"
@@ -339,6 +341,114 @@ function PlatformCard({
             </Button>
           )}
         </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Moving finished videos to Google Drive (the same rclone remote YtPipeline uses). Published
+ * videos move once every destination has them, rejected ones too; each is uploaded and checked
+ * before its files leave this PC. Per-video Move / Bring back live in the Review tab's History.
+ */
+function DriveCard() {
+  const qc = useQueryClient();
+  const { data: drive } = useQuery({
+    queryKey: ["drive"],
+    queryFn: api.drive,
+    refetchInterval: (q) => ((q.state.data as { moving?: unknown } | undefined)?.moving ? 3000 : 15000),
+  });
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ["drive"] });
+    qc.invalidateQueries({ queryKey: ["jobs"] });
+  };
+  const setAuto = useMutation({ mutationFn: api.setDriveAuto, onSuccess: refresh });
+  const moveAll = useMutation({ mutationFn: api.moveAllToDrive, onSuccess: refresh });
+
+  const gb = (b: number) => (b >= 1024 ** 3 ? `${(b / 1024 ** 3).toFixed(1)} GB` : `${Math.round(b / 1024 ** 2)} MB`);
+
+  return (
+    <Card>
+      <CardContent className="space-y-4 py-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="flex size-9 items-center justify-center rounded-lg bg-primary/15 text-primary">
+              <Cloud className="size-5" />
+            </div>
+            <div>
+              <p className="text-sm font-medium">Move finished videos to Google Drive</p>
+              <p className="text-xs text-muted-foreground">
+                {drive?.autoMove
+                  ? "On — published and rejected videos move automatically."
+                  : "Off — videos only move when you press the button."}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {setAuto.isPending && <Spinner className="text-muted-foreground" />}
+            <Switch
+              checked={drive?.autoMove ?? false}
+              disabled={!drive || setAuto.isPending}
+              onCheckedChange={(v) => setAuto.mutate(v)}
+            />
+          </div>
+        </div>
+
+        {drive && (
+          <div className="grid gap-2 text-sm sm:grid-cols-3">
+            <div className="rounded-md border border-border bg-secondary/40 p-3">
+              <p className="text-xs text-muted-foreground">In Google Drive</p>
+              <p className="font-semibold">
+                {drive.inDrive} video{drive.inDrive === 1 ? "" : "s"}
+              </p>
+            </div>
+            <div className="rounded-md border border-border bg-secondary/40 p-3">
+              <p className="text-xs text-muted-foreground">Freed on this PC</p>
+              <p className="font-semibold">{gb(drive.freedBytes)}</p>
+            </div>
+            <div className="rounded-md border border-border bg-secondary/40 p-3">
+              <p className="text-xs text-muted-foreground">Ready to move</p>
+              <p className="font-semibold">{drive.waiting}</p>
+            </div>
+          </div>
+        )}
+
+        {drive?.moving && (
+          <p className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Spinner /> {drive.moving.what === "moving" ? "Moving" : "Bringing back"} {drive.moving.id}…
+          </p>
+        )}
+
+        <div className="flex flex-wrap items-center gap-3">
+          <Button
+            variant="outline"
+            disabled={!drive || moveAll.isPending || drive.waiting === 0}
+            onClick={() => moveAll.mutate()}
+          >
+            {moveAll.isPending ? <Spinner /> : <CloudUpload className="size-4" />}
+            Move all published &amp; rejected now
+          </Button>
+          {drive && (
+            <span className="text-xs text-muted-foreground">
+              Goes to <code className="font-mono">{drive.remote}</code>. Each video is uploaded and checked
+              first; the thumbnail stays so it keeps its place in the lists.
+            </span>
+          )}
+        </div>
+
+        {drive && drive.failed.length > 0 && (
+          <div className="space-y-1 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-200">
+            <p className="flex items-center gap-1 font-medium text-amber-300">
+              <AlertCircle className="size-4" /> Couldn't move {drive.failed.length} video
+              {drive.failed.length === 1 ? "" : "s"} — nothing on this PC was deleted
+            </p>
+            {drive.failed.map((f) => (
+              <p key={f.id} className="break-words">
+                <span className="font-mono">{f.id}</span>: {f.error}
+              </p>
+            ))}
+          </div>
+        )}
       </CardContent>
     </Card>
   );

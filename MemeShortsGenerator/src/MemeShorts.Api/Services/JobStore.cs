@@ -209,6 +209,8 @@ public sealed class JobStore
         // Null on rows written before Facebook/Instagram existed — ToJob() defaults them.
         public PersistedPlatform? Facebook { get; set; }
         public PersistedPlatform? Instagram { get; set; }
+        public DriveCopy? Drive { get; set; }
+        public string? DriveError { get; set; }
 
         public static PersistedJob From(GenerationJob j) => new()
         {
@@ -224,6 +226,7 @@ public sealed class JobStore
             PublishAtUtc = j.PublishAtUtc, UploadError = j.UploadError,
             Facebook = PersistedPlatform.From(j.Facebook),
             Instagram = PersistedPlatform.From(j.Instagram),
+            Drive = j.Drive, DriveError = j.DriveError,
         };
 
         public GenerationJob ToJob()
@@ -254,6 +257,8 @@ public sealed class JobStore
             j.UploadError = UploadError;
             j.Facebook = Facebook?.ToPlatform() ?? new PlatformPublish();
             j.Instagram = Instagram?.ToPlatform() ?? new PlatformPublish();
+            j.Drive = Drive;
+            j.DriveError = DriveError;
             return j;
         }
     }

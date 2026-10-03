@@ -22,12 +22,19 @@ builder.Services.Configure<InstagramOptions>(builder.Configuration.GetSection("I
 builder.Services.Configure<TitleStyleOptions>(builder.Configuration.GetSection("Titles"));
 builder.Services.Configure<PerformanceOptions>(builder.Configuration.GetSection("Performance"));
 builder.Services.Configure<ChannelsOptions>(builder.Configuration.GetSection("Channels"));
+builder.Services.Configure<ProfanityOptions>(builder.Configuration.GetSection("Profanity"));
+builder.Services.Configure<DriveOptions>(builder.Configuration.GetSection("Drive"));
 
 // ---- Services ----
 builder.Services.AddHttpClient(); // for ElevenLabs
 builder.Services.AddHttpClient("wikimedia", WikimediaImageService.Configure);
 // Commons first; when it has nothing, Codex draws one rather than leaving the line pictureless.
 builder.Services.AddSingleton<WikimediaImageService>();
+builder.Services.Configure<PicturesOptions>(builder.Configuration.GetSection("Pictures"));
+builder.Services.AddHttpClient("openverse", StockPhotoSetup.Configure);
+builder.Services.AddHttpClient("pexels", StockPhotoSetup.Configure);
+builder.Services.AddSingleton<OpenverseImageService>();
+builder.Services.AddSingleton<PexelsImageService>();
 builder.Services.AddSingleton<IStockImageService, FallbackImageService>();
 
 // TTS provider is selected at startup. ElevenLabs is used only when a key + voice are
@@ -77,9 +84,23 @@ builder.Services.AddSingleton<IOcrService>(sp =>
     OperatingSystem.IsWindowsVersionAtLeast(10, 0, 19041)
         ? new WindowsOcrService(sp.GetRequiredService<ILogger<WindowsOcrService>>())
         : new NullOcrService());
+// Blurs the swear words out of a pasted screenshot before it is filmed.
+builder.Services.AddSingleton<ProfanityFilter>();
+builder.Services.AddSingleton<ImageCensorService>();
+// Turns a photo shot on a plain background into a cutout for the list format's cards.
+builder.Services.AddSingleton<CutoutService>();
+// Checks the FINISHED mp4, not the plan. Everything else here validates the slicing
+// decision, which is how a video with a half-empty card reached Review marked "Info".
+builder.Services.AddSingleton<RenderValidator>();
 builder.Services.AddSingleton<ChannelRegistry>();
 builder.Services.AddScoped<PipelineService>();
 builder.Services.AddSingleton<JobManager>();
+builder.Services.AddSingleton<ListAutoMaker>();
+builder.Services.AddSingleton<ListBatchRunner>();
+builder.Services.AddSingleton<DriveArchiver>();
+// One instance serves both as the background mover and as "Move all" behind the Settings tab.
+builder.Services.AddSingleton<DriveAutoMover>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<DriveAutoMover>());
 
 builder.WebHost.UseUrls(builder.Configuration["Urls"] ?? "http://localhost:5180");
 
@@ -96,6 +117,38 @@ Directory.CreateDirectory(renderTmp);
 Environment.SetEnvironmentVariable("TMP", renderTmp);
 Environment.SetEnvironmentVariable("TEMP", renderTmp);
 app.Logger.LogInformation("Child-process TEMP -> {Tmp}", renderTmp);
+
+// Sweep what crashed renders left behind. Remotion cleans up its bundle and frame folders when a
+// render ENDS; when one dies - killed, out of memory, out of disk - they simply stay. They had
+// been accumulating since August: 376 folders holding 7.4GB, which filled the D: drive outright
+// and then failed every later render at the first file copy ("ENOSPC ... bg.mp4"), a failure that
+// reads like a bug in the video and is nothing of the kind.
+//
+// Best-effort and time-based: anything still being written by a live render is far newer than the
+// cutoff, and a folder that will not delete is skipped rather than killing startup.
+try
+{
+    var cutoff = DateTime.UtcNow.AddHours(-6);
+    var swept = 0L;
+    foreach (var dir in Directory.EnumerateDirectories(renderTmp))
+    {
+        try
+        {
+            if (Directory.GetLastWriteTimeUtc(dir) >= cutoff) continue;
+            swept += new DirectoryInfo(dir).EnumerateFiles("*", SearchOption.AllDirectories)
+                                           .Sum(f => f.Length);
+            Directory.Delete(dir, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+    }
+    if (swept > 0)
+        app.Logger.LogInformation("Swept {MB:N0} MB of stale render temp from {Tmp}.",
+            swept / 1024d / 1024, renderTmp);
+}
+catch (Exception ex)
+{
+    app.Logger.LogWarning(ex, "Could not sweep {Tmp}.", renderTmp);
+}
 
 // Surface the active providers at startup so config changes (e.g. switching to
 // ElevenLabs) are visibly confirmed in the log.
@@ -166,6 +219,14 @@ app.MapPost("/api/settings/voice/reset", (VoiceSettingsStore voice) =>
 app.MapPost("/api/jobs/{id}/revoice", (string id, JobManager jobs) =>
 {
     var job = jobs.Revoice(id);
+    return job is null ? Results.NotFound() : Results.Ok(JobStatusDto.From(job));
+});
+
+// Overrule the finished-video check for one job and send it to review. Goes no further than the
+// review queue — approving it is still a separate, manual step.
+app.MapPost("/api/jobs/{id}/accept-check", (string id, JobManager jobs) =>
+{
+    var job = jobs.AcceptFailedCheck(id);
     return job is null ? Results.NotFound() : Results.Ok(JobStatusDto.From(job));
 });
 
@@ -323,7 +384,7 @@ app.MapPost("/api/generate", (GenerateRequest req, JobManager jobs) =>
 // caught in a second or two instead of after a three-minute render.
 app.MapPost("/api/repost/preflight", async (
     HttpRequest http, IOcrService ocr, PostSliceService slicer, DiagramSliceService diagrams,
-    CancellationToken ct) =>
+    ProfanityFilter profanity, CancellationToken ct) =>
 {
     if (!http.HasFormContentType)
         return Results.BadRequest(new { error = "expected a multipart form with an image" });
@@ -350,6 +411,7 @@ app.MapPost("/api/repost/preflight", async (
                 RepostComposer.StripLeadingArtifact(x.Segment.Text.Trim())))
             .ToList();
 
+        var cropTops = PostSliceService.CropTops(bands.Blocks, bands.Width, bands.HeaderBottom);
         var ink = PostSliceService.InkGrid(tmp, bands.Background, 4);
         var issues = PostPlanValidator.Validate(bands, spoken, ink, 4);
         return Results.Ok(new
@@ -359,20 +421,92 @@ app.MapPost("/api/repost/preflight", async (
             headerBottom = bands.HeaderBottom,
             isDiagram = bands.IsDiagram,
             gutter = bands.Gutter,
+            // Why the columns did or did not survive. Both halves of a comparison arriving at
+            // once is the most reported defect in this format, and the reason was previously
+            // only in a log line nobody sees.
+            columnNote = bands.ColumnNote,
             severity = PostPlanValidator.Worst(issues).ToString(),
             issues = issues.Select(i => new { severity = i.Severity.ToString(), i.Code, i.Message }),
             spoken,
+            // What would be blurred out of the picture, and where. Reported here rather than
+            // only in the render log because a FALSE positive - an innocent word covered up -
+            // is invisible in the finished video unless you happen to be looking at that frame.
+            profanity = profanity.Scan(ocrLines)
+                .Select(h => new { h.Word, h.Left, h.Top, h.Right, h.Bottom }),
             // The raw OCR geometry, so a bad slice plan can be traced back to what the reader
             // actually saw rather than guessed at from the finished blocks.
             ocr = ocrLines.Select(l => new { l.Text, l.Left, l.Top, l.Right, l.Bottom }),
+            // cropTop is where the slice actually STARTS DRAWING - a caption reaches up to keep
+            // the line spacing above it. Reported because the reveal is built from it, not from
+            // Top, and a check that reads Top alone cannot see the whole class of defect where
+            // two slices end up drawing the same rows.
             slices = bands.Blocks.Select(b => new
             {
                 b.Top, b.Bottom, b.IsMedia, b.Text,
+                cropTop = cropTops.TryGetValue(b, out var ct) ? ct : b.Top,
                 side = b.Side.ToString(), b.Group, b.XLeft, b.XRight,
             }),
         });
     }
     finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
+});
+
+// Blur the swear words out of one picture and hand the censored PNG straight back.
+//
+// The pipeline does this on its own before every repost render; this is the way to SEE the
+// result without spending a render on it - what got covered, how hard, and whether an innocent
+// word was caught. Same code, same OCR pass, so what comes back is what the video will show.
+app.MapPost("/api/repost/censor", async (
+    HttpRequest http, IOcrService ocr, ImageCensorService censor, CancellationToken ct) =>
+{
+    if (!http.HasFormContentType)
+        return Results.BadRequest(new { error = "expected a multipart form with an image" });
+    var form = await http.ReadFormAsync(ct);
+    var image = form.Files["image"];
+    if (image is null || image.Length == 0)
+        return Results.BadRequest(new { error = "no image supplied" });
+    if (!OperatingSystem.IsWindows() || !ocr.Available)
+        return Results.BadRequest(new { error = "OCR is not available on this machine" });
+
+    var dir = Directory.CreateTempSubdirectory("censor_").FullName;
+    var tmp = Path.Combine(dir, "post" + Path.GetExtension(image.FileName));
+    try
+    {
+        await using (var dest = File.Create(tmp)) await image.CopyToAsync(dest, ct);
+
+        var lines = await ocr.ReadLinesAsync(tmp, ct);
+        var censored = censor.Censor(tmp, lines);
+        // Nothing to cover: hand back exactly what was sent, so the caller can save the result
+        // unconditionally instead of branching on whether the post happened to swear.
+        var bytes = await File.ReadAllBytesAsync(censored is null ? tmp : Path.Combine(dir, censored), ct);
+        return Results.File(bytes, censored is null ? image.ContentType ?? "image/png" : "image/png");
+    }
+    finally { try { Directory.Delete(dir, true); } catch { } }
+});
+
+// Run the post-render checks against a job's existing mp4.
+//
+// Here so a suspect video can be examined without re-rendering it, and so the validator itself
+// can be tested against videos already known to be bad - a validator that passes the videos
+// Matthew rejected would be worse than none.
+app.MapPost("/api/jobs/{id}/validate-render", async (
+    string id, bool? columns, JobManager jobs, RenderValidator validator, CancellationToken ct) =>
+{
+    var job = jobs.Get(id);
+    if (job is null) return Results.NotFound();
+    var mp4 = Path.Combine(job.OutputDir, "short.mp4");
+    if (!File.Exists(mp4)) return Results.BadRequest(new { error = "this job has no rendered video" });
+    if (!OperatingSystem.IsWindows()) return Results.BadRequest(new { error = "windows only" });
+
+    var seconds = await validator.ProbeSecondsAsync(mp4, ct);
+    var issues = await validator.ValidateAsync(mp4, seconds, columns ?? true, ct);
+    return Results.Ok(new
+    {
+        id,
+        seconds,
+        ok = issues.Count == 0,
+        issues = issues.Select(i => new { fault = i.Fault.ToString(), i.Message }),
+    });
 });
 
 app.MapPost("/api/ocr", async (HttpRequest http, IOcrService ocr, CancellationToken ct) =>
@@ -501,13 +635,12 @@ app.MapPost("/api/generate/repost", async (HttpRequest http, JobManager jobs, Ch
     static string? NullIfBlank(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
 });
 
-// List short: a run of pictures with one spoken line each. Multipart like the repost endpoint,
-// but it carries MANY images — item i is paired with line i of the script, which is the whole
-// point of the format.
+// List short: a run of photos or clips with one spoken line each. The multipart field keeps its
+// old "images" name for API compatibility; item i is paired with line i of the script.
 app.MapPost("/api/generate/list", async (HttpRequest http, JobManager jobs, ChannelRegistry channels) =>
 {
     if (!http.HasFormContentType)
-        return Results.BadRequest(new { error = "expected a multipart form (images + lines)" });
+        return Results.BadRequest(new { error = "expected a multipart form (media + lines)" });
 
     var form = await http.ReadFormAsync();
     var images = form.Files.Where(f => f.Name == "images").ToList();
@@ -515,15 +648,22 @@ app.MapPost("/api/generate/list", async (HttpRequest http, JobManager jobs, Chan
         .Replace("\r\n", "\n").Split('\n')
         .Select(l => l.Trim()).Where(l => l.Length > 0).ToList();
 
-    if (images.Count == 0) return Results.BadRequest(new { error = "add at least one picture" });
-    if (lines.Count == 0) return Results.BadRequest(new { error = "write one line per picture" });
+    if (images.Count == 0) return Results.BadRequest(new { error = "add at least one photo or clip" });
+    if (lines.Count == 0) return Results.BadRequest(new { error = "write one line per media item" });
     if (lines.Count != images.Count)
         return Results.BadRequest(new
         {
-            error = $"{images.Count} picture(s) but {lines.Count} line(s) — the format pairs them one to one",
+            error = $"{images.Count} media item(s) but {lines.Count} line(s) — the format pairs them one to one",
         });
     if (images.Any(i => i.Length > 25 * 1024 * 1024))
-        return Results.BadRequest(new { error = "one of the images is larger than 25 MB" });
+        return Results.BadRequest(new { error = "one of the media files is larger than 25 MB" });
+
+    var mediaExtensions = images.Select(MediaExtFor).ToList();
+    if (mediaExtensions.Any(ext => ext is null))
+        return Results.BadRequest(new
+        {
+            error = "use PNG, JPEG, WebP, GIF, MP4, WebM, MOV, or M4V media",
+        });
 
     var channelId = form["channel"].ToString();
     var ch = channels.Resolve(string.IsNullOrWhiteSpace(channelId) ? null : channelId);
@@ -531,6 +671,9 @@ app.MapPost("/api/generate/list", async (HttpRequest http, JobManager jobs, Chan
         return Results.BadRequest(new { error = $"channel '{ch.Id}' is not a list channel" });
 
     var mascot = form.Files["mascot"];
+    var mascotExtension = mascot is null ? null : ImageExtFor(mascot);
+    if (mascot is not null && mascotExtension is null)
+        return Results.BadRequest(new { error = "the mascot must be a PNG, JPEG, WebP, or GIF image" });
     var title = form["title"].ToString().Trim();
     var topic = title.Length > 0 ? title : string.Join(" ", lines).Trim();
     if (topic.Length > 120) topic = topic[..120];
@@ -540,14 +683,14 @@ app.MapPost("/api/generate/list", async (HttpRequest http, JobManager jobs, Chan
         var input = new ListInput { Title = NullIfBlankList(title) };
         for (int i = 0; i < images.Count; i++)
         {
-            var ext = ExtFor(images[i]);
+            var ext = mediaExtensions[i]!;
             var name = $"item_{i}{ext}";
             using (var dest = File.Create(Path.Combine(j.OutputDir, name))) images[i].CopyTo(dest);
             input.Items.Add(new ListItem { Image = name, Text = lines[i] });
         }
         if (mascot is not null)
         {
-            var name = "mascot" + ExtFor(mascot);
+            var name = "mascot" + mascotExtension!;
             using var dest = File.Create(Path.Combine(j.OutputDir, name));
             mascot.CopyTo(dest);
             input.Mascot = name;
@@ -561,20 +704,36 @@ app.MapPost("/api/generate/list", async (HttpRequest http, JobManager jobs, Chan
 
     static string? NullIfBlankList(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
 
-    // A clipboard paste arrives with a generic or missing filename, so the content type is the
-    // reliable signal and the extension only a hint.
-    static string ExtFor(IFormFile f)
+    // A clipboard paste can have a generic filename, so prefer a recognised MIME type and use
+    // the extension as a fallback for browsers that submit application/octet-stream.
+    static string? MediaExtFor(IFormFile f)
     {
-        var ext = Path.GetExtension(f.FileName ?? "").ToLowerInvariant();
-        if (ext is ".png" or ".jpg" or ".jpeg" or ".webp" or ".gif") return ext;
-        return (f.ContentType ?? "").ToLowerInvariant() switch
+        var contentType = (f.ContentType ?? "").ToLowerInvariant();
+        var fromType = contentType switch
         {
+            "image/png" => ".png",
             "image/jpeg" or "image/jpg" => ".jpg",
             "image/webp" => ".webp",
             "image/gif" => ".gif",
-            _ => ".png",
+            "video/mp4" => ".mp4",
+            "video/webm" => ".webm",
+            "video/quicktime" => ".mov",
+            "video/x-m4v" => ".m4v",
+            _ => null,
         };
+        if (fromType is not null) return fromType;
+
+        var ext = Path.GetExtension(f.FileName ?? "").ToLowerInvariant();
+        return ext is ".png" or ".jpg" or ".jpeg" or ".webp" or ".gif"
+            or ".mp4" or ".webm" or ".mov" or ".m4v"
+            ? ext
+            : null;
     }
+
+    static string? ImageExtFor(IFormFile f) => MediaExtFor(f) is { } ext
+        && ext is ".png" or ".jpg" or ".jpeg" or ".webp" or ".gif"
+            ? ext
+            : null;
 });
 
 // ---- List short drafts -------------------------------------------------------------------
@@ -604,10 +763,12 @@ app.MapPost("/api/list/draft", async (
     // Without the second half, discarding a suggestion changed nothing and the next press of
     // "suggest" handed back the very same idea.
     var avoid = jobs.RecentTopics(30).Concat(suggested.Recent(20)).Distinct().ToList();
-    var idea = await codex.GenerateListIdeaAsync(styleTitles, req.Topic, avoid, ct);
+    var idea = await codex.GenerateListIdeaAsync(styleTitles, req.Topic, avoid, ct,
+        jobs.ListHistory(ch.Id));
     if (idea is null)
         return Results.Problem("Codex could not come up with one. Try again, or type a subject.");
-    suggested.Add(idea.Title);
+    // Title plus subject: a title can hide what it is about ("the clingiest AI keychain").
+    suggested.Add(string.IsNullOrWhiteSpace(idea.Subject) ? idea.Title : $"{idea.Title} (about: {idea.Subject})");
 
     var id = Guid.NewGuid().ToString("n")[..8];
     var dir = DraftDir(pipe.Value, env, id);
@@ -615,15 +776,28 @@ app.MapPost("/api/list/draft", async (
 
     var staged = new List<object>();
     var used = new List<string>();      // Commons titles already spoken for, so no picture repeats
+    FoundImage? previous = null;
     for (int i = 0; i < idea.Items.Count; i++)
     {
         var item = idea.Items[i];
-        var found = await images.FetchAsync(item.Image, dir, $"item_{i}", used, ct);
+        // Same term as the line before = hold the same picture (see /api/generate/list/auto).
+        var holds = i > 0 && string.Equals(item.Image.Trim(), idea.Items[i - 1].Image.Trim(),
+            StringComparison.OrdinalIgnoreCase);
+        var kind = PictureKind.Normalize(item.Kind);
+        // The draft opens straight away so the script can be read while pictures arrive. Drawn
+        // pictures (objects, scenes) come back as placeholders for the page to fill, three at a
+        // time; a real named thing gets the quick exact Commons lookup here, and the page draws
+        // it only if that found nothing.
+        var found = holds ? previous
+            : PictureKind.DrawnFirst(kind) ? null
+            : await images.FetchAsync(item.Image, dir, $"item_{i}", used, ct, exactTermOnly: true);
+        previous = found;
         if (found is not null) used.Add(found.SourceTitle);
         staged.Add(new
         {
             text = item.Text,
             term = item.Image,
+            kind,
             file = found?.FileName,
             credit = found?.Credit,
             source = found?.SourceTitle,
@@ -631,7 +805,7 @@ app.MapPost("/api/list/draft", async (
         });
     }
 
-    return Results.Ok(new { id, title = idea.Title, items = staged });
+    return Results.Ok(new { id, title = idea.Title, source = idea.Source, items = staged });
 });
 
 // Re-search ONE line's picture without touching the rest of the draft.
@@ -646,8 +820,12 @@ app.MapPost("/api/list/draft/{id}/image", async (
     // Exclude is what the OTHER lines are already using, so a re-search cannot land on a
     // picture that is on screen elsewhere in the same video.
     var found = await images.FetchAsync(
-        req.Term, dir, $"item_{req.Index}_{Guid.NewGuid():n}"[..14], req.Exclude, ct);
-    if (found is null) return Results.Ok(new { file = (string?)null, message = $"nothing found for “{req.Term}”" });
+        req.Term, dir, $"item_{req.Index}_{Guid.NewGuid():n}"[..14], req.Exclude, ct, kind: req.Kind);
+    if (found is null) return Results.Ok(new
+    {
+        file = (string?)null,
+        message = $"Codex could not create “{req.Term}” and no exact Commons image was found.",
+    });
 
     return Results.Ok(new
     {
@@ -737,82 +915,44 @@ app.MapPost("/api/list/draft/{id}/confirm", (
 // Reference-channel titles go in only to aim at the KIND of subject that works in this niche —
 // the prompt is explicit that it must write a new video rather than a version of a listed one.
 app.MapPost("/api/generate/list/auto", async (
-    ListAutoRequest req, JobManager jobs, ChannelRegistry channels, ICodexClient codex,
-    ITitleStyleService titleStyle, IStockImageService images, SuggestionHistory suggested,
-    ILoggerFactory lf, CancellationToken ct) =>
+    ListAutoRequest req, ListAutoMaker maker, CancellationToken ct) =>
 {
-    var log = lf.CreateLogger("ListAuto");
+    var r = await maker.MakeAsync(req.Channel, req.Topic, ct);
+    if (!r.Ok)
+        return r.QuotaHit
+            ? Results.Json(new { error = r.Error }, statusCode: StatusCodes.Status503ServiceUnavailable)
+            : Results.Problem(r.Error);
+    return Results.Ok(new
+    {
+        id = r.JobId,
+        title = r.Title,
+        lines = r.Lines,
+        droppedLines = r.DroppedLines,
+        source = r.Source,
+    });
+});
+
+// Several hands-off list videos from one click on the Generate page, made one after another in
+// the background (see ListBatchRunner). The page polls GET for progress.
+app.MapPost("/api/generate/list/batch", (ListBatchRequest req, ListBatchRunner batch, JobManager jobs,
+    ChannelRegistry channels) =>
+{
     var ch = channels.Resolve(string.IsNullOrWhiteSpace(req.Channel) ? null : req.Channel);
     if (!ch.IsList)
         return Results.BadRequest(new { error = $"channel '{ch.Id}' is not a list channel" });
-
-    var styleTitles = await titleStyle.GetStyleTitlesAsync(ch.TitleReferenceChannel, ch.TitleTab, ct);
-    if (styleTitles.Count == 0)
-        log.LogWarning("No reference titles for {Channel}; Codex will pick a subject unaided.", ch.Id);
-
-    var avoid = jobs.RecentTopics(30).Concat(suggested.Recent(20)).Distinct().ToList();
-    var idea = await codex.GenerateListIdeaAsync(styleTitles, req.Topic, avoid, ct);
-    if (idea is null)
-        return Results.Problem("Codex could not come up with one. Try again, or type a subject.");
-    suggested.Add(idea.Title);
-
-    // Reserve the job first so the pictures can be downloaded straight into its folder.
-    var topic = string.IsNullOrWhiteSpace(idea.Title) ? idea.Items[0].Text : idea.Title;
-    if (topic.Length > 120) topic = topic[..120];
-
-    var missing = new List<string>();
-    var job = jobs.Create(topic, "list", ch.Id, autoGenerated: true, prepare: j =>
-    {
-        var input = new ListInput { Title = idea.Title };
-        var credits = new List<string>();
-        var used = new List<string>();      // Commons titles already spoken for, so no picture repeats
-
-        for (int i = 0; i < idea.Items.Count; i++)
-        {
-            var item = idea.Items[i];
-            // Synchronous inside prepare: the job folder has to be complete before the pipeline
-            // picks it up, or a restart mid-download would leave a job that cannot render.
-            var found = images.FetchAsync(item.Image, j.OutputDir, $"item_{i}", used, ct)
-                .GetAwaiter().GetResult();
-            if (found is null)
-            {
-                missing.Add(item.Image);
-                // HOLD the previous picture rather than dropping the line. Dropping loses a
-                // step of the argument — the first run lost the line explaining the runes and
-                // the payoff then referred back to something never said. A line held over the
-                // wrong-ish picture still makes sense; a missing line does not.
-                if (input.Items.Count > 0)
-                    input.Items.Add(new ListItem { Image = input.Items[^1].Image, Text = item.Text });
-                continue;
-            }
-            input.Items.Add(new ListItem { Image = found.FileName, Text = item.Text });
-            credits.Add(found.Credit);
-            used.Add(found.SourceTitle);
-        }
-
-        File.WriteAllText(Path.Combine(j.OutputDir, "list.json"),
-            JsonSerializer.Serialize(input, new JsonSerializerOptions { WriteIndented = true }),
-            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-
-        // Commons licences require credit, so it travels with the job and lands in the
-        // description rather than being remembered by hand.
-        if (credits.Count > 0)
-            File.WriteAllText(Path.Combine(j.OutputDir, "image_credits.txt"),
-                string.Join("\n", credits), new UTF8Encoding(false));
-    });
-
-    if (missing.Count > 0)
-        log.LogWarning("List idea '{Title}': no picture for {N} line(s): {Terms}",
-            idea.Title, missing.Count, string.Join("; ", missing));
-
-    return Results.Ok(new
-    {
-        id = job.Id,
-        title = idea.Title,
-        lines = idea.Items.Count,
-        droppedLines = missing.Count,
-    });
+    if (jobs.GenerationPaused)
+        return Results.Conflict(new { error = "Generation is paused. Resume it first." });
+    if (req.Count < 1 || req.Count > ListBatchRunner.MaxCount)
+        return Results.BadRequest(new { error = $"Pick between 1 and {ListBatchRunner.MaxCount} videos." });
+    var started = batch.Start(ch.Id, req.Count);
+    return started is null
+        ? Results.Conflict(new { error = "A batch is already running. Stop it or wait for it to finish." })
+        : Results.Ok(started);
 });
+
+app.MapGet("/api/generate/list/batch", (ListBatchRunner batch) => Results.Ok(batch.Status()));
+
+app.MapPost("/api/generate/list/batch/stop", (ListBatchRunner batch) => Results.Ok(batch.Stop()));
 
 // Hands-off batch: brainstorm N topics with Codex (in the channel's style) and queue a job
 // for each. Returns the created job ids so the UI can track them. Each lands in the review
@@ -1051,9 +1191,72 @@ app.MapGet("/api/jobs/{id}/thumbnail", (string id, JobManager jobs) =>
 app.MapGet("/api/jobs/{id}/video", (string id, JobManager jobs) =>
 {
     var job = jobs.Get(id);
+    if (job?.Drive is { } drive)
+        return Results.NotFound(new { error = $"This video is in Google Drive ({drive.Remote}). Bring it back to play it here." });
     if (job?.VideoPath is null || !File.Exists(job.VideoPath))
         return Results.NotFound();
     return Results.File(job.VideoPath, "video/mp4", enableRangeProcessing: true);
+});
+
+// --- Google Drive (see DriveArchiver) --------------------------------------------------------
+// Both directions run in the background; the Review tab polls the job's driveTransfer/driveError.
+app.MapPost("/api/jobs/{id}/drive/move", (string id, JobManager jobs, DriveArchiver drive, ILogger<Program> log) =>
+{
+    var job = jobs.Get(id);
+    if (job is null) return Results.NotFound();
+    if (!drive.CanMove(job, out var why)) return Results.Conflict(new { error = why });
+    _ = Task.Run(async () =>
+    {
+        try { await drive.MoveAsync(job, CancellationToken.None); }
+        catch (Exception ex) { log.LogWarning("Move of {Id} to Google Drive failed: {Why}", id, ex.Message); }
+    });
+    return Results.Accepted(value: new { started = true });
+});
+
+app.MapPost("/api/jobs/{id}/drive/restore", (string id, JobManager jobs, DriveArchiver drive, ILogger<Program> log) =>
+{
+    var job = jobs.Get(id);
+    if (job is null) return Results.NotFound();
+    if (job.Drive is null) return Results.Conflict(new { error = "This video's files are already on this PC." });
+    if (job.DriveTransfer is not null) return Results.Conflict(new { error = $"It is {job.DriveTransfer} right now." });
+    _ = Task.Run(async () =>
+    {
+        try { await drive.BringBackAsync(job, CancellationToken.None); }
+        catch (Exception ex) { log.LogWarning("Bring-back of {Id} from Google Drive failed: {Why}", id, ex.Message); }
+    });
+    return Results.Accepted(value: new { started = true });
+});
+
+app.MapGet("/api/drive", (JobManager jobs, DriveArchiver drive) =>
+{
+    var all = jobs.All().ToList();
+    var inDrive = all.Where(j => j.Drive is not null).ToList();
+    return Results.Ok(new
+    {
+        remote = drive.RemoteRoot,
+        autoMove = drive.AutoMove,
+        inDrive = inDrive.Count,
+        freedBytes = inDrive.Sum(j => j.Drive!.Bytes),
+        waiting = all.Count(drive.IsDoneWith),
+        moving = all.FirstOrDefault(j => j.DriveTransfer is not null) is { } busy
+            ? new { id = busy.Id, what = busy.DriveTransfer } : null,
+        failed = all.Where(j => j.DriveError is not null && j.Drive is null)
+            .Select(j => new { id = j.Id, error = j.DriveError }).Take(5),
+    });
+});
+
+app.MapPost("/api/drive/auto", (ToggleRequest req, DriveArchiver drive) =>
+{
+    drive.AutoMove = req.Enabled;
+    return Results.Ok(new { autoMove = drive.AutoMove });
+});
+
+// "Move all published & rejected now": the same pass the automatic mover makes, started at once.
+app.MapPost("/api/drive/move-all", (JobManager jobs, DriveArchiver drive, DriveAutoMover mover) =>
+{
+    var due = jobs.All().Count(drive.IsDoneWith);
+    _ = Task.Run(() => mover.MoveDueAsync(CancellationToken.None, ignoreRecentFailures: true));
+    return Results.Accepted(value: new { queued = due });
 });
 
 // Storyboard JSON (handy for debugging what Codex produced)
@@ -1076,9 +1279,10 @@ record AutoGenerateRequest(int Count, string? Format, string? Channel);
 
 /// <summary>One-click list short. Topic is optional — blank lets Codex pick the subject.</summary>
 record ListAutoRequest(string? Topic, string? Channel);
+record ListBatchRequest(int Count, string? Channel);
 
 /// <summary>Re-search one draft line's picture, e.g. after Codex's own term missed.</summary>
-record ReplaceImageRequest(int Index, string Term, List<string>? Exclude);
+record ReplaceImageRequest(int Index, string Term, List<string>? Exclude, string? Kind = null);
 
 record ConfirmDraftRequest(string? Title, string? Channel, List<ConfirmDraftItem>? Items);
 record ConfirmDraftItem(string Text, string? File, string? Credit);

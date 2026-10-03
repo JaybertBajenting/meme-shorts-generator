@@ -119,13 +119,16 @@ public sealed class RemotionRenderer : IVideoRenderer
             KillStrayRenderers(preexisting);
         }
 
-        var hint = LooksLikeOutOfMemory(res.StdErr)
-            ? " The compositor ran out of memory. Close other apps, lower Remotion:Concurrency, " +
-              "or set Remotion:ImageFormat=jpeg — PNG frames cost far more memory."
-            : "";
+        var hint = LooksLikeOutOfDisk(res.StdErr)
+            ? " THE DISK IS FULL — this is not a fault in the video. Free space on the drive " +
+              "holding render-tmp and render it again."
+            : LooksLikeOutOfMemory(res.StdErr)
+                ? " The compositor ran out of memory. Close other apps, lower Remotion:Concurrency, " +
+                  "or set Remotion:ImageFormat=jpeg — PNG frames cost far more memory."
+                : "";
         throw new InvalidOperationException(
             $"Remotion render failed after {attempts} attempt(s) (exit {res.ExitCode}).{hint}\n" +
-            $"STDERR:\n{Tail(res.StdErr)}\nSTDOUT(tail):\n{Tail(res.StdOut)}");
+            $"STDERR:\n{Ends(res.StdErr)}\nSTDOUT(tail):\n{Tail(res.StdOut)}");
     }
 
     /// <summary>
@@ -235,4 +238,26 @@ public sealed class RemotionRenderer : IVideoRenderer
 
     private static string Tail(string s, int n = 1500) =>
         string.IsNullOrEmpty(s) ? "" : (s.Length <= n ? s : "…" + s[^n..]);
+
+    /// <summary>
+    /// Keep BOTH ends of a child process's error output.
+    ///
+    /// Node puts the diagnosis on the FIRST line - "ENOSPC: no space left on device, copyfile
+    /// ...bg.mp4" - and a dozen stack frames after it. Keeping only the tail threw the diagnosis
+    /// away and kept the frames, so a full disk was reported as an opaque "render failed" that
+    /// read like a bug in the video and was nothing of the kind.
+    /// </summary>
+    private static string Ends(string s, int head = 700, int tail = 900) =>
+        string.IsNullOrEmpty(s) ? ""
+        : s.Length <= head + tail ? s
+        : s[..head] + "\n…\n" + s[^tail..];
+
+    /// <summary>
+    /// A full disk, which Remotion hits at its very first file copy and reports as a bare exit 1.
+    /// </summary>
+    private static bool LooksLikeOutOfDisk(string stderr) =>
+        !string.IsNullOrEmpty(stderr)
+        && (stderr.Contains("ENOSPC", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("no space left", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("not enough space on the disk", StringComparison.OrdinalIgnoreCase));
 }

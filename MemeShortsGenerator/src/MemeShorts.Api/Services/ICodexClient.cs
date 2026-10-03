@@ -20,7 +20,10 @@ public interface ICodexClient
     /// Draw a plain picture of <paramref name="subject"/> — the fallback for when a photo
     /// archive has nothing. Returns false if nothing was produced.
     /// </summary>
-    Task<bool> GenerateStockImageAsync(string subject, string outputPngPath, CancellationToken ct = default);
+    /// <param name="isolated">True: one object on plain white, to be cut out onto a white sticker.
+    /// False: a full-frame photograph of the scene.</param>
+    Task<bool> GenerateStockImageAsync(string subject, string outputPngPath, CancellationToken ct = default,
+        bool isolated = true);
 
     /// <summary>
     /// Title a reposted post in the reference channel's voice. Reposts have no storyboard to
@@ -36,8 +39,11 @@ public interface ICodexClient
     ///
     /// <paramref name="winningTitles"/> are the best-performing titles from the reference
     /// channel — used to aim at the SUBJECTS that work in this niche (word oddities, puns,
-    /// object trivia), not to rewrite any particular video. Null if the CLI fails.
+    /// object trivia), not to rewrite any particular video. <paramref name="history"/> is this
+    /// channel's own past - latest scripts and titles, every subject covered - so the new one does
+    /// not repeat them. Null if the CLI fails.
     /// </summary>
     Task<ListIdea?> GenerateListIdeaAsync(IReadOnlyList<string> winningTitles, string? seedTopic = null,
-        IReadOnlyList<string>? avoid = null, CancellationToken ct = default);
+        IReadOnlyList<string>? avoid = null, CancellationToken ct = default,
+        ListHistory? history = null);
 }
