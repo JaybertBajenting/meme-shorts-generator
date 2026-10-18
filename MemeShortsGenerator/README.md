@@ -19,6 +19,8 @@ Topic ─▶ ASP.NET Core API + Web UI
        UI polls status ──▶ plays the result
 ```
 
+> **Picking this up?** Read [`docs/HANDOVER.md`](docs/HANDOVER.md) first (setup, what git does not hold, owner rules, open items), then [`docs/notes/INDEX.md`](docs/notes/INDEX.md).
+
 ## Layout
 
 ```
